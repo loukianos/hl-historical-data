@@ -11,8 +11,12 @@ mod grpc;
 #[command(version)]
 struct Cli {
     /// Path to TOML configuration file
-    #[arg(short, long, default_value = "config.toml")]
+    #[arg(short, long, global = true, default_value = "config.toml")]
     config: String,
+
+    /// Override log filter (example: info,debug,trace)
+    #[arg(long, global = true)]
+    log_level: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -72,14 +76,15 @@ enum AdminAction {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let cli = Cli::parse();
+    let env_filter = match &cli.log_level {
+        Some(level) => tracing_subscriber::EnvFilter::try_new(level)?,
+        None => tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+    };
+
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+
     let cfg = config::load(&cli.config)?;
 
     match cli.command {
