@@ -1,0 +1,4 @@
+# Keep clippy expectations explicit for this repo scaffold.
+msrv = "1.75"
+too-many-arguments-threshold = 8
+type-complexity-threshold = 300
