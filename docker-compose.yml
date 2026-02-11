@@ -1,0 +1,24 @@
+services:
+  questdb:
+    image: questdb/questdb:8.2.3
+    container_name: hl-questdb
+    restart: unless-stopped
+    ports:
+      - "9000:9000"   # Web console
+      - "9009:9009"   # ILP (InfluxDB Line Protocol)
+      - "8812:8812"   # PostgreSQL wire protocol
+    volumes:
+      - "${HL_DATA_DIR:-./.data}/questdb:/var/lib/questdb"
+    environment:
+      - QDB_LINE_TCP_MAINTENANCE_JOB_INTERVAL=1000
+      - QDB_PG_ENABLED=true
+      - QDB_LINE_TCP_ENABLED=true
+
+  redis:
+    image: redis:7-alpine
+    container_name: hl-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - "${HL_DATA_DIR:-./.data}/redis:/data"

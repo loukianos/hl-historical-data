@@ -1,0 +1,17 @@
+[questdb]
+ilp_host = "localhost"
+ilp_port = 9009
+pg_host = "localhost"
+pg_port = 8812
+
+[grpc]
+host = "127.0.0.1"
+port = 50051
+
+[backfill]
+s3_bucket = "hl-mainnet-node-data"
+s3_prefix = "node_fills_by_block/hourly"
+temp_dir = "/tmp/hl-backfill"
+
+[retention]
+ttl_days = 0  # 0 = keep forever

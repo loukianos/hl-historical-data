@@ -1,0 +1,37 @@
+# Rust build artifacts
+/target/
+
+# Data directories
+.data/
+
+# Temp backfill files
+/tmp/hl-backfill/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+
+# Generated Python protobuf stubs
+src/clients/python/hl-historical-client/src/hl_historical_client/proto/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
