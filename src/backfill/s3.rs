@@ -6,7 +6,7 @@ use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::types::RequestPayer;
 use aws_sdk_s3::Client;
-use chrono::{Duration, NaiveDate};
+use chrono::{Duration, NaiveDate, NaiveDateTime, Timelike};
 use std::path::Path;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
@@ -60,19 +60,51 @@ pub fn generate_hourly_keys(prefix: &str, from: &str, to: &str) -> Result<Vec<St
         bail!("invalid date range: --to ({to}) is before --from ({from})");
     }
 
-    let mut current = from_date
+    let start_inclusive = from_date
         .and_hms_opt(0, 0, 0)
-        .context("failed to construct start-of-day timestamp")?
-        .and_utc();
+        .context("failed to construct start-of-day timestamp")?;
     let end_exclusive = to_date
         .succ_opt()
         .context("date overflow while computing end of range")?
         .and_hms_opt(0, 0, 0)
-        .context("failed to construct end-of-day timestamp")?
-        .and_utc();
+        .context("failed to construct end-of-day timestamp")?;
+
+    generate_hourly_keys_between(prefix, start_inclusive, end_exclusive)
+}
+
+/// Generate S3 keys for an hour window [start_inclusive, end_exclusive).
+///
+/// Both bounds must be UTC-aligned to the top of the hour.
+pub fn generate_hourly_keys_between(
+    prefix: &str,
+    start_inclusive: NaiveDateTime,
+    end_exclusive: NaiveDateTime,
+) -> Result<Vec<String>> {
+    if end_exclusive < start_inclusive {
+        bail!(
+            "invalid hourly range: end ({}) is before start ({})",
+            end_exclusive,
+            start_inclusive
+        );
+    }
+
+    if !is_hour_aligned(start_inclusive) {
+        bail!(
+            "invalid hourly range: start ({}) is not aligned to hour boundary",
+            start_inclusive
+        );
+    }
+
+    if !is_hour_aligned(end_exclusive) {
+        bail!(
+            "invalid hourly range: end ({}) is not aligned to hour boundary",
+            end_exclusive
+        );
+    }
 
     let normalized_prefix = prefix.trim_matches('/');
     let mut keys = Vec::new();
+    let mut current = start_inclusive;
 
     while current < end_exclusive {
         let date = current.format(DATE_FORMAT);
@@ -89,6 +121,10 @@ pub fn generate_hourly_keys(prefix: &str, from: &str, to: &str) -> Result<Vec<St
     }
 
     Ok(keys)
+}
+
+fn is_hour_aligned(ts: NaiveDateTime) -> bool {
+    ts.minute() == 0 && ts.second() == 0 && ts.nanosecond() == 0
 }
 
 fn parse_yyyymmdd(value: &str, flag_name: &str) -> Result<NaiveDate> {
@@ -259,7 +295,10 @@ fn classify_error(code: Option<&str>, message: &str) -> DownloadErrorClass {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_error, generate_hourly_keys, DownloadErrorClass};
+    use super::{
+        classify_error, generate_hourly_keys, generate_hourly_keys_between, DownloadErrorClass,
+    };
+    use chrono::NaiveDate;
 
     #[test]
     fn single_day_generates_24_hourly_keys() {
@@ -312,6 +351,42 @@ mod tests {
             .expect_err("bad date format should fail");
 
         assert!(err.to_string().contains("expected YYYYMMDD"));
+    }
+
+    #[test]
+    fn generate_hourly_keys_between_respects_exclusive_end_hour() {
+        let start = NaiveDate::from_ymd_opt(2025, 7, 28)
+            .unwrap()
+            .and_hms_opt(8, 0, 0)
+            .unwrap();
+        let end = NaiveDate::from_ymd_opt(2025, 7, 28)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
+
+        let keys = generate_hourly_keys_between("node_fills_by_block/hourly", start, end)
+            .expect("hourly range should parse");
+
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], "node_fills_by_block/hourly/20250728/08.lz4");
+        assert_eq!(keys[1], "node_fills_by_block/hourly/20250728/09.lz4");
+    }
+
+    #[test]
+    fn generate_hourly_keys_between_rejects_non_aligned_start() {
+        let start = NaiveDate::from_ymd_opt(2025, 7, 28)
+            .unwrap()
+            .and_hms_opt(8, 30, 0)
+            .unwrap();
+        let end = NaiveDate::from_ymd_opt(2025, 7, 28)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
+
+        let err = generate_hourly_keys_between("node_fills_by_block/hourly", start, end)
+            .expect_err("non-hour-aligned start should fail");
+
+        assert!(err.to_string().contains("not aligned to hour boundary"));
     }
 
     #[test]

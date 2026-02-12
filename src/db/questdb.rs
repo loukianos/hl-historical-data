@@ -175,6 +175,17 @@ impl QuestDbReader {
         .await
     }
 
+    /// Query the most recent ingested `fills.time` timestamp.
+    pub async fn max_fills_time(&self) -> Result<Option<NaiveDateTime>> {
+        let row = self
+            .query_one("SELECT max(time) FROM fills", &[])
+            .await
+            .context("failed to query max(time) from fills")?;
+
+        row.try_get::<_, Option<NaiveDateTime>>(0)
+            .map_err(|e| anyhow!("Could not decode max(time) from fills: {e}"))
+    }
+
     /// Execute a query that must return exactly one row.
     pub async fn query_one(&self, sql: &str, params: SqlParams<'_>) -> Result<Row> {
         let client = self.connect().await?;

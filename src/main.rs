@@ -99,7 +99,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Backfill { sync, from, to } => {
             if sync {
                 tracing::info!("Syncing to present...");
-                backfill::sync_to_present(&cfg).await?;
+                let report = backfill::sync_to_present(&cfg).await?;
+                println!("{}", report.render(cfg.backfill.keep_temp_files));
             } else {
                 let from = from.expect("--from required when not using --sync");
                 let to = to.expect("--to required when not using --sync");
