@@ -12,6 +12,7 @@ port = 50051
 s3_bucket = "hl-mainnet-node-data"
 s3_prefix = "node_fills_by_block/hourly"
 temp_dir = "/tmp/hl-backfill"
+keep_temp_files = false  # true = retain .lz4/.jsonl temp artifacts for debugging
 
 [retention]
 ttl_days = 0  # 0 = keep forever

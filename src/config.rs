@@ -32,6 +32,8 @@ pub struct BackfillConfig {
     pub s3_bucket: String,
     pub s3_prefix: String,
     pub temp_dir: String,
+    #[serde(default)]
+    pub keep_temp_files: bool,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
@@ -77,6 +79,7 @@ impl Default for BackfillConfig {
             s3_bucket: "hl-mainnet-node-data".to_string(),
             s3_prefix: "node_fills_by_block/hourly".to_string(),
             temp_dir: "/tmp/hl-backfill".to_string(),
+            keep_temp_files: false,
         }
     }
 }
@@ -204,5 +207,40 @@ ttl_days = 0
 
         assert!(err_text.contains("unknown field"));
         assert!(err_text.contains("extra_field"));
+    }
+
+    #[test]
+    fn keep_temp_files_defaults_to_false_when_omitted() {
+        let temp_path = write_temp_config(
+            r#"
+[questdb]
+ilp_host = "localhost"
+ilp_port = 9009
+pg_host = "localhost"
+pg_port = 8812
+
+[grpc]
+host = "127.0.0.1"
+port = 50051
+
+[backfill]
+s3_bucket = "hl-mainnet-node-data"
+s3_prefix = "node_fills_by_block/hourly"
+temp_dir = "/tmp/hl-backfill"
+
+[retention]
+ttl_days = 0
+"#,
+        );
+
+        let config = load(
+            temp_path
+                .to_str()
+                .expect("temp config path should be valid utf-8"),
+        )
+        .expect("config without keep_temp_files should parse");
+
+        let _ = fs::remove_file(&temp_path);
+        assert!(!config.backfill.keep_temp_files);
     }
 }
