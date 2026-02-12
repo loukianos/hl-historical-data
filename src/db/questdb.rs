@@ -1,5 +1,6 @@
 use crate::config::QuestDbConfig;
 use anyhow::{anyhow, bail, Context, Result};
+use chrono::NaiveDateTime;
 use std::io;
 use std::pin::Pin;
 use tokio::io::AsyncWriteExt;
@@ -146,6 +147,32 @@ impl QuestDbReader {
     pub async fn execute(&self, sql: &str, params: SqlParams<'_>) -> Result<u64> {
         let client = self.connect().await?;
         Ok(client.execute(sql, params).await?)
+    }
+
+    /// Delete `fills` rows for a half-open time range [start, end_exclusive).
+    pub async fn delete_fills_in_range(
+        &self,
+        start: NaiveDateTime,
+        end_exclusive: NaiveDateTime,
+    ) -> Result<u64> {
+        self.execute(
+            "DELETE FROM fills WHERE time >= $1 AND time < $2",
+            &[&start, &end_exclusive],
+        )
+        .await
+    }
+
+    /// Delete `fills_quarantine` rows for a half-open time range [start, end_exclusive).
+    pub async fn delete_fills_quarantine_in_range(
+        &self,
+        start: NaiveDateTime,
+        end_exclusive: NaiveDateTime,
+    ) -> Result<u64> {
+        self.execute(
+            "DELETE FROM fills_quarantine WHERE time >= $1 AND time < $2",
+            &[&start, &end_exclusive],
+        )
+        .await
     }
 
     /// Execute a query that must return exactly one row.
