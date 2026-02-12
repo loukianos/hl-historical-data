@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 type ExtraFields = BTreeMap<String, Value>;
 
 const UNKNOWN_FIELD_LOG_EVERY: u64 = 10_000;
+const GAINING_INVENTORY_EPSILON: f64 = 1e-12;
 static UNKNOWN_ENVELOPE_FIELD_COUNT: AtomicU64 = AtomicU64::new(0);
 static UNKNOWN_FILL_FIELD_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -27,6 +28,8 @@ pub struct RawFill {
     pub fee: String,
     pub tid: i64,
     pub fee_token: String,
+    #[serde(rename = "type")]
+    pub explicit_type: Option<String>,
     // Known but currently unused field seen in source data.
     #[allow(dead_code)]
     pub dir: Option<String>,
@@ -100,6 +103,30 @@ fn maybe_log_unknown_fields(kind: &'static str, extra: &ExtraFields) {
     }
 }
 
+fn derive_is_buy(side: &str) -> bool {
+    side == "B"
+}
+
+fn derive_fill_type(explicit_type: Option<&str>, coin: &str) -> String {
+    if let Some(explicit_type) = explicit_type {
+        let normalized = explicit_type.trim().to_ascii_uppercase();
+        if !normalized.is_empty() {
+            return normalized;
+        }
+    }
+
+    if coin.starts_with('@') {
+        "SPOT".to_string()
+    } else {
+        "PERP".to_string()
+    }
+}
+
+fn derive_is_gaining_inventory(start_position: f64, sz: f64, is_buy: bool) -> bool {
+    let result_position = start_position + if is_buy { sz } else { -sz };
+    result_position.abs() > start_position.abs() + GAINING_INVENTORY_EPSILON
+}
+
 /// Parse a single JSONL line into zero or more fills.
 pub fn parse_line(line: &str) -> Result<Vec<ParsedFill>> {
     let envelope: BlockEnvelope = serde_json::from_str(line)?;
@@ -112,23 +139,11 @@ pub fn parse_line(line: &str) -> Result<Vec<ParsedFill>> {
 
         let px: f64 = raw.px.parse()?;
         let sz: f64 = raw.sz.parse()?;
-        let is_buy = raw.side == "B";
+        let is_buy = derive_is_buy(&raw.side);
         let start_position: f64 = raw.start_position.parse()?;
 
-        // Derive fill type
-        let fill_type = if raw.coin.starts_with('@') {
-            "SPOT".to_string()
-        } else {
-            "PERP".to_string()
-        };
-
-        // Derive is_gaining_inventory
-        let result_position = if is_buy {
-            start_position + sz
-        } else {
-            start_position - sz
-        };
-        let is_gaining_inventory = result_position.abs() > start_position.abs();
+        let fill_type = derive_fill_type(raw.explicit_type.as_deref(), &raw.coin);
+        let is_gaining_inventory = derive_is_gaining_inventory(start_position, sz, is_buy);
 
         fills.push(ParsedFill {
             time_ms: raw.time,
@@ -216,6 +231,172 @@ mod tests {
 
         assert_eq!(fills[1].address, "0xdef");
         assert_eq!(fills[1].fill_type, "SPOT");
+    }
+
+    #[test]
+    fn parse_line_derives_issue_13_fields() {
+        let line = r#"{
+            "local_time":"2025-07-27T08:50:10.334741319",
+            "block_time":"2025-07-27T08:50:10.273720809",
+            "block_number":676607012,
+            "events":[
+                ["0x1",{
+                    "coin":"BTC",
+                    "px":"100.0",
+                    "sz":"0.1",
+                    "side":"B",
+                    "time":1753606210273,
+                    "startPosition":"-1.0",
+                    "closedPnl":"0.0",
+                    "hash":"0x1",
+                    "oid":1,
+                    "crossed":false,
+                    "fee":"0.0",
+                    "tid":11,
+                    "feeToken":"USDC"
+                }],
+                ["0x2",{
+                    "coin":"BTC",
+                    "px":"100.0",
+                    "sz":"0.1",
+                    "side":"A",
+                    "time":1753606210274,
+                    "startPosition":"-1.0",
+                    "closedPnl":"0.0",
+                    "hash":"0x2",
+                    "oid":2,
+                    "crossed":false,
+                    "fee":"0.0",
+                    "tid":12,
+                    "feeToken":"USDC"
+                }],
+                ["0x3",{
+                    "coin":"ETH",
+                    "px":"100.0",
+                    "sz":"0.1",
+                    "side":"B",
+                    "time":1753606210275,
+                    "startPosition":"1.0",
+                    "closedPnl":"0.0",
+                    "hash":"0x3",
+                    "oid":3,
+                    "crossed":false,
+                    "fee":"0.0",
+                    "tid":13,
+                    "feeToken":"USDC"
+                }],
+                ["0x4",{
+                    "coin":"ETH",
+                    "px":"100.0",
+                    "sz":"0.1",
+                    "side":"A",
+                    "time":1753606210276,
+                    "startPosition":"1.0",
+                    "closedPnl":"0.0",
+                    "hash":"0x4",
+                    "oid":4,
+                    "crossed":false,
+                    "fee":"0.0",
+                    "tid":14,
+                    "feeToken":"USDC"
+                }],
+                ["0x5",{
+                    "coin":"@PURR/USDC",
+                    "px":"0.32",
+                    "sz":"2.0",
+                    "side":"A",
+                    "time":1753606210277,
+                    "startPosition":"10.0",
+                    "closedPnl":"0.0",
+                    "hash":"0x5",
+                    "oid":5,
+                    "crossed":false,
+                    "fee":"0.0",
+                    "tid":15,
+                    "feeToken":"USDC"
+                }],
+                ["0x6",{
+                    "coin":"@PURR/USDC",
+                    "type":"perp",
+                    "px":"0.31",
+                    "sz":"1.0",
+                    "side":"B",
+                    "time":1753606210278,
+                    "startPosition":"10.0",
+                    "closedPnl":"0.0",
+                    "hash":"0x6",
+                    "oid":6,
+                    "crossed":false,
+                    "fee":"0.0",
+                    "tid":16,
+                    "feeToken":"USDC"
+                }]
+            ]
+        }"#;
+
+        let fills = parse_line(line).expect("line should parse");
+        assert_eq!(fills.len(), 6);
+
+        // B/A mapping for is_buy.
+        assert!(fills[0].is_buy);
+        assert!(!fills[1].is_buy);
+
+        // Type derivation and explicit override.
+        assert_eq!(fills[0].fill_type, "PERP");
+        assert_eq!(fills[4].fill_type, "SPOT");
+        assert_eq!(fills[5].fill_type, "PERP");
+
+        // Inventory direction examples.
+        assert!(!fills[0].is_gaining_inventory); // -1.0 + buy 0.1 => -0.9
+        assert!(fills[1].is_gaining_inventory); // -1.0 + sell 0.1 => -1.1
+        assert!(fills[2].is_gaining_inventory); // +1.0 + buy 0.1 => +1.1
+        assert!(!fills[3].is_gaining_inventory); // +1.0 + sell 0.1 => +0.9
+    }
+
+    #[test]
+    fn parse_line_uses_epsilon_for_is_gaining_inventory() {
+        let line = r#"{
+            "local_time":"2025-07-27T08:50:10.334741319",
+            "block_time":"2025-07-27T08:50:10.273720809",
+            "block_number":676607012,
+            "events":[
+                ["0x1",{
+                    "coin":"BTC",
+                    "px":"100.0",
+                    "sz":"0.0000000000005",
+                    "side":"B",
+                    "time":1753606210273,
+                    "startPosition":"1.0",
+                    "closedPnl":"0.0",
+                    "hash":"0xe1",
+                    "oid":21,
+                    "crossed":false,
+                    "fee":"0.0",
+                    "tid":121,
+                    "feeToken":"USDC"
+                }],
+                ["0x2",{
+                    "coin":"BTC",
+                    "px":"100.0",
+                    "sz":"0.000000000002",
+                    "side":"B",
+                    "time":1753606210274,
+                    "startPosition":"1.0",
+                    "closedPnl":"0.0",
+                    "hash":"0xe2",
+                    "oid":22,
+                    "crossed":false,
+                    "fee":"0.0",
+                    "tid":122,
+                    "feeToken":"USDC"
+                }]
+            ]
+        }"#;
+
+        let fills = parse_line(line).expect("line should parse");
+        assert_eq!(fills.len(), 2);
+        assert!(!fills[0].is_gaining_inventory);
+        assert!(fills[1].is_gaining_inventory);
     }
 
     #[test]
