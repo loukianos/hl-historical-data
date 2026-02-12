@@ -1,8 +1,30 @@
 use crate::config::BackfillConfig;
 use anyhow::{bail, Context, Result};
+use aws_config::meta::region::RegionProviderChain;
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::operation::get_object::GetObjectError;
+use aws_sdk_s3::types::RequestPayer;
+use aws_sdk_s3::Client;
 use chrono::{Duration, NaiveDate};
+use std::path::Path;
+use tokio::io::AsyncWriteExt;
 
 const DATE_FORMAT: &str = "%Y%m%d";
+
+/// Result of attempting to download a single hourly S3 object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadOutcome {
+    Downloaded,
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadErrorClass {
+    Missing,
+    Auth,
+    Other,
+}
 
 /// Generate S3 keys for hourly files in a date range.
 ///
@@ -54,14 +76,157 @@ fn parse_yyyymmdd(value: &str, flag_name: &str) -> Result<NaiveDate> {
 }
 
 /// Download a single S3 object to a local path.
-pub async fn download_file(_config: &BackfillConfig, _key: &str, _dest: &str) -> Result<()> {
-    // TODO: implement S3 download with requester-pays
-    Ok(())
+///
+/// - Uses AWS default credential resolution (env, profile, IAM role, etc.)
+/// - Sends `request_payer=requester` for requester-pays buckets
+/// - Missing keys are treated as non-fatal (`DownloadOutcome::Missing`)
+/// - Auth/access failures are returned as actionable errors
+pub async fn download_file(
+    config: &BackfillConfig,
+    key: &str,
+    dest: &str,
+) -> Result<DownloadOutcome> {
+    let s3 = build_client().await;
+
+    let response = s3
+        .get_object()
+        .bucket(&config.s3_bucket)
+        .key(key)
+        .request_payer(RequestPayer::Requester)
+        .send()
+        .await;
+
+    let output = match response {
+        Ok(output) => output,
+        Err(err) => match classify_get_object_error(&err) {
+            DownloadErrorClass::Missing => {
+                tracing::warn!(
+                    "S3 object missing; skipping s3://{}/{}",
+                    config.s3_bucket,
+                    key
+                );
+                return Ok(DownloadOutcome::Missing);
+            }
+            DownloadErrorClass::Auth => {
+                bail!(
+                    "Failed to download s3://{}/{} due to AWS auth/permission error: {}. \
+                     Ensure AWS credentials are configured and have requester-pays GetObject access.",
+                    config.s3_bucket,
+                    key,
+                    err
+                );
+            }
+            DownloadErrorClass::Other => {
+                return Err(err).with_context(|| {
+                    format!("failed to download s3://{}/{}", config.s3_bucket, key)
+                });
+            }
+        },
+    };
+
+    let dest_path = Path::new(dest);
+    if let Some(parent) = dest_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent).await.with_context(|| {
+                format!(
+                    "failed to create destination directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+    }
+
+    let mut file = tokio::fs::File::create(dest_path)
+        .await
+        .with_context(|| format!("failed to create destination file {}", dest_path.display()))?;
+
+    let mut body_reader = output.body.into_async_read();
+    let bytes_written = tokio::io::copy(&mut body_reader, &mut file).await;
+
+    match bytes_written {
+        Ok(bytes_written) => {
+            file.flush().await.with_context(|| {
+                format!("failed to flush destination file {}", dest_path.display())
+            })?;
+            tracing::info!(
+                "Downloaded s3://{}/{} -> {} ({} bytes)",
+                config.s3_bucket,
+                key,
+                dest_path.display(),
+                bytes_written
+            );
+            Ok(DownloadOutcome::Downloaded)
+        }
+        Err(err) => {
+            let _ = tokio::fs::remove_file(dest_path).await;
+            Err(err).with_context(|| {
+                format!(
+                    "failed while writing downloaded object to {}",
+                    dest_path.display()
+                )
+            })
+        }
+    }
+}
+
+async fn build_client() -> Client {
+    let region_provider = RegionProviderChain::default_provider().or_else("us-east-1");
+
+    let aws_config = aws_config::defaults(BehaviorVersion::latest())
+        .region(region_provider)
+        .load()
+        .await;
+
+    Client::new(&aws_config)
+}
+
+fn classify_get_object_error<R>(err: &SdkError<GetObjectError, R>) -> DownloadErrorClass {
+    let code = err
+        .as_service_error()
+        .and_then(|service_err| service_err.code());
+
+    classify_error(code, &err.to_string())
+}
+
+fn classify_error(code: Option<&str>, message: &str) -> DownloadErrorClass {
+    if let Some(code) = code {
+        if code.eq_ignore_ascii_case("NoSuchKey") {
+            return DownloadErrorClass::Missing;
+        }
+
+        if code.eq_ignore_ascii_case("AccessDenied")
+            || code.eq_ignore_ascii_case("InvalidAccessKeyId")
+            || code.eq_ignore_ascii_case("SignatureDoesNotMatch")
+            || code.eq_ignore_ascii_case("ExpiredToken")
+            || code.eq_ignore_ascii_case("AuthorizationHeaderMalformed")
+            || code.eq_ignore_ascii_case("RequestTimeTooSkewed")
+        {
+            return DownloadErrorClass::Auth;
+        }
+    }
+
+    let message = message.to_ascii_lowercase();
+    if message.contains("nosuchkey") || message.contains("no such key") {
+        return DownloadErrorClass::Missing;
+    }
+
+    if message.contains("accessdenied")
+        || message.contains("invalidaccesskeyid")
+        || message.contains("signaturedoesnotmatch")
+        || message.contains("expiredtoken")
+        || message.contains("credentials")
+        || message.contains("credential")
+        || message.contains("forbidden")
+    {
+        return DownloadErrorClass::Auth;
+    }
+
+    DownloadErrorClass::Other
 }
 
 #[cfg(test)]
 mod tests {
-    use super::generate_hourly_keys;
+    use super::{classify_error, generate_hourly_keys, DownloadErrorClass};
 
     #[test]
     fn single_day_generates_24_hourly_keys() {
@@ -122,5 +287,37 @@ mod tests {
             .expect_err("reversed range should fail");
 
         assert!(err.to_string().contains("is before --from"));
+    }
+
+    #[test]
+    fn classifies_missing_key_errors() {
+        assert_eq!(
+            classify_error(Some("NoSuchKey"), "boom"),
+            DownloadErrorClass::Missing
+        );
+        assert_eq!(
+            classify_error(None, "service error: NoSuchKey"),
+            DownloadErrorClass::Missing
+        );
+    }
+
+    #[test]
+    fn classifies_auth_errors() {
+        assert_eq!(
+            classify_error(Some("AccessDenied"), "boom"),
+            DownloadErrorClass::Auth
+        );
+        assert_eq!(
+            classify_error(None, "Unable to load credentials"),
+            DownloadErrorClass::Auth
+        );
+    }
+
+    #[test]
+    fn leaves_unknown_errors_as_other() {
+        assert_eq!(
+            classify_error(Some("SlowDown"), "throttled"),
+            DownloadErrorClass::Other
+        );
     }
 }
