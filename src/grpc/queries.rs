@@ -22,6 +22,18 @@ const GET_FILLS_BASE_SQL: &str = concat!(
     "fee_token, cloid, builder_fee, builder, local_time ",
     "FROM fills WHERE time >= $1 AND time < $2"
 );
+const GET_FILL_BY_HASH_SQL: &str = concat!(
+    "SELECT time, block_time, block_number, address, coin, type, px, sz, is_buy, ",
+    "start_position, is_gaining_inventory, closed_pnl, hash, oid, crossed, fee, tid, ",
+    "fee_token, cloid, builder_fee, builder, local_time ",
+    "FROM fills WHERE hash = $1 ORDER BY time ASC"
+);
+const GET_FILLS_BY_OID_SQL: &str = concat!(
+    "SELECT time, block_time, block_number, address, coin, type, px, sz, is_buy, ",
+    "start_position, is_gaining_inventory, closed_pnl, hash, oid, crossed, fee, tid, ",
+    "fee_token, cloid, builder_fee, builder, local_time ",
+    "FROM fills WHERE oid = $1 ORDER BY time ASC"
+);
 
 #[derive(Debug)]
 struct ParsedGetFillsRequest {
@@ -76,7 +88,7 @@ impl proto::historical_data_service_server::HistoricalDataService for QueryServi
         let mut row_stream = reader
             .query_stream(&sql, &params)
             .await
-            .map_err(map_query_start_error)?;
+            .map_err(|err| map_query_start_error("GetFills", err))?;
 
         let (tx, rx) = mpsc::channel(GET_FILLS_STREAM_BUFFER);
         tokio::spawn(async move {
@@ -121,20 +133,78 @@ impl proto::historical_data_service_server::HistoricalDataService for QueryServi
 
     async fn get_fill_by_hash(
         &self,
-        _request: Request<proto::GetFillByHashRequest>,
+        request: Request<proto::GetFillByHashRequest>,
     ) -> Result<Response<proto::GetFillByHashResponse>, Status> {
-        // TODO: implement query
-        Err(Status::unimplemented("GetFillByHash not yet implemented"))
+        let hash = parse_get_fill_by_hash_request(request.into_inner())?;
+
+        let reader = QuestDbReader::new(&self.config.questdb);
+        let rows = reader
+            .query(GET_FILL_BY_HASH_SQL, &[&hash])
+            .await
+            .map_err(|err| map_query_start_error("GetFillByHash", err))?;
+
+        let fills = rows
+            .iter()
+            .map(row_to_fill)
+            .collect::<Result<Vec<_>, Status>>()?;
+
+        Ok(Response::new(proto::GetFillByHashResponse { fills }))
     }
 
     type GetFillsByOidStream = ReceiverStream<Result<proto::GetFillsByOidResponse, Status>>;
 
     async fn get_fills_by_oid(
         &self,
-        _request: Request<proto::GetFillsByOidRequest>,
+        request: Request<proto::GetFillsByOidRequest>,
     ) -> Result<Response<Self::GetFillsByOidStream>, Status> {
-        // TODO: implement query
-        Err(Status::unimplemented("GetFillsByOid not yet implemented"))
+        let oid = parse_get_fills_by_oid_request(request.into_inner())?;
+        let params: Vec<&(dyn ToSql + Sync)> = vec![&oid];
+
+        let reader = QuestDbReader::new(&self.config.questdb);
+        let mut row_stream = reader
+            .query_stream(GET_FILLS_BY_OID_SQL, &params)
+            .await
+            .map_err(|err| map_query_start_error("GetFillsByOid", err))?;
+
+        let (tx, rx) = mpsc::channel(GET_FILLS_STREAM_BUFFER);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tx.closed() => return,
+                    next_row = row_stream.next() => {
+                        match next_row {
+                            Some(Ok(row)) => match row_to_fill(&row) {
+                                Ok(fill) => {
+                                    if tx
+                                        .send(Ok(proto::GetFillsByOidResponse { fill: Some(fill) }))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                Err(status) => {
+                                    let _ = tx.send(Err(status)).await;
+                                    return;
+                                }
+                            },
+                            Some(Err(err)) => {
+                                tracing::error!(error = %err, "GetFillsByOid row stream failed");
+                                let _ = tx
+                                    .send(Err(Status::unavailable(
+                                        "QuestDB stream error during GetFillsByOid query",
+                                    )))
+                                    .await;
+                                return;
+                            }
+                            None => return,
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     type GetVWAPStream = ReceiverStream<Result<proto::GetVwapResponse, Status>>;
@@ -176,18 +246,18 @@ impl proto::historical_data_service_server::HistoricalDataService for QueryServi
     }
 }
 
-fn map_query_start_error(err: anyhow::Error) -> Status {
-    tracing::error!(error = %err, "failed to start GetFills query");
+fn map_query_start_error(operation: &'static str, err: anyhow::Error) -> Status {
+    tracing::error!(operation, error = %err, "failed to start query");
 
     if err
         .downcast_ref::<PgError>()
         .and_then(|pg_err| pg_err.as_db_error())
         .is_some()
     {
-        return Status::internal("GetFills query failed due to a database error");
+        return Status::internal(format!("{operation} query failed due to a database error"));
     }
 
-    Status::unavailable("QuestDB unavailable while starting GetFills query")
+    Status::unavailable(format!("QuestDB unavailable while starting {operation} query"))
 }
 
 fn parse_get_fills_request(
@@ -212,6 +282,14 @@ fn parse_get_fills_request(
         side_is_buy: parse_side_filter(request.side)?,
         crossed_only: request.crossed_only.unwrap_or(false),
     })
+}
+
+fn parse_get_fill_by_hash_request(request: proto::GetFillByHashRequest) -> Result<String, Status> {
+    normalize_required_string(request.hash, "hash")
+}
+
+fn parse_get_fills_by_oid_request(request: proto::GetFillsByOidRequest) -> Result<i64, Status> {
+    require_positive_i64(request.oid, "oid")
 }
 
 fn require_non_zero_timestamp(
@@ -249,6 +327,25 @@ fn naive_to_timestamp(value: NaiveDateTime) -> Timestamp {
         seconds: datetime.timestamp(),
         nanos: datetime.timestamp_subsec_nanos() as i32,
     }
+}
+
+fn normalize_required_string(value: String, field: &'static str) -> Result<String, Status> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(Status::invalid_argument(format!("{field} cannot be empty")));
+    }
+
+    Ok(trimmed.to_string())
+}
+
+fn require_positive_i64(value: i64, field: &'static str) -> Result<i64, Status> {
+    if value <= 0 {
+        return Err(Status::invalid_argument(format!(
+            "{field} must be a positive integer"
+        )));
+    }
+
+    Ok(value)
 }
 
 fn normalize_optional_string(
@@ -406,6 +503,57 @@ mod tests {
     }
 
     #[test]
+    fn normalize_required_string_rejects_blank_values() {
+        let err = normalize_required_string("   ".to_string(), "hash")
+            .expect_err("blank hash should fail");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn normalize_required_string_trims_values() {
+        let hash =
+            normalize_required_string(" 0xabc123 ".to_string(), "hash").expect("hash should normalize");
+        assert_eq!(hash, "0xabc123");
+    }
+
+    #[test]
+    fn require_positive_i64_rejects_non_positive_values() {
+        let zero = require_positive_i64(0, "oid").expect_err("zero oid should fail");
+        assert_eq!(zero.code(), tonic::Code::InvalidArgument);
+
+        let negative = require_positive_i64(-1, "oid").expect_err("negative oid should fail");
+        assert_eq!(negative.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn parse_get_fill_by_hash_request_rejects_blank_hash() {
+        let request = proto::GetFillByHashRequest {
+            hash: "   ".to_string(),
+        };
+
+        let err = parse_get_fill_by_hash_request(request).expect_err("blank hash should fail");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn parse_get_fill_by_hash_request_trims_hash() {
+        let request = proto::GetFillByHashRequest {
+            hash: " 0xdeadbeef ".to_string(),
+        };
+
+        let hash = parse_get_fill_by_hash_request(request).expect("hash should parse");
+        assert_eq!(hash, "0xdeadbeef");
+    }
+
+    #[test]
+    fn parse_get_fills_by_oid_request_rejects_zero_oid() {
+        let request = proto::GetFillsByOidRequest { oid: 0 };
+
+        let err = parse_get_fills_by_oid_request(request).expect_err("zero oid should fail");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
     fn parse_side_filter_maps_enum_values() {
         assert_eq!(parse_side_filter(None).expect("none should parse"), None);
         assert_eq!(
@@ -437,6 +585,18 @@ mod tests {
         assert!(sql.contains("is_buy = $5"));
         assert!(sql.contains("crossed = true"));
         assert!(sql.ends_with("ORDER BY time ASC"));
+    }
+
+    #[test]
+    fn get_fill_by_hash_sql_contains_expected_clauses() {
+        assert!(GET_FILL_BY_HASH_SQL.contains("WHERE hash = $1"));
+        assert!(GET_FILL_BY_HASH_SQL.ends_with("ORDER BY time ASC"));
+    }
+
+    #[test]
+    fn get_fills_by_oid_sql_contains_expected_clauses() {
+        assert!(GET_FILLS_BY_OID_SQL.contains("WHERE oid = $1"));
+        assert!(GET_FILLS_BY_OID_SQL.ends_with("ORDER BY time ASC"));
     }
 
     #[test]
