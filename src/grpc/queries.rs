@@ -34,6 +34,8 @@ const GET_FILLS_BY_OID_SQL: &str = concat!(
     "fee_token, cloid, builder_fee, builder, local_time ",
     "FROM fills WHERE oid = $1 ORDER BY time ASC"
 );
+const LIST_COINS_SQL: &str =
+    "SELECT coin, count() AS fill_count FROM fills GROUP BY coin ORDER BY fill_count DESC";
 
 #[derive(Debug)]
 struct ParsedGetFillsRequest {
@@ -241,8 +243,18 @@ impl proto::historical_data_service_server::HistoricalDataService for QueryServi
         &self,
         _request: Request<proto::ListCoinsRequest>,
     ) -> Result<Response<proto::ListCoinsResponse>, Status> {
-        // TODO: implement query
-        Err(Status::unimplemented("ListCoins not yet implemented"))
+        let reader = QuestDbReader::new(&self.config.questdb);
+        let rows = reader
+            .query(LIST_COINS_SQL, &[])
+            .await
+            .map_err(|err| map_query_start_error("ListCoins", err))?;
+
+        let coins = rows
+            .iter()
+            .map(row_to_coin_info)
+            .collect::<Result<Vec<_>, Status>>()?;
+
+        Ok(Response::new(proto::ListCoinsResponse { coins }))
     }
 }
 
@@ -429,6 +441,29 @@ where
     })
 }
 
+fn i64_or_i32_as_i64<E>(
+    primary: Result<i64, E>,
+    fallback: impl FnOnce() -> Result<i32, E>,
+) -> Result<i64, E> {
+    primary.or_else(|_| fallback().map(i64::from))
+}
+
+fn decode_required_count(row: &Row, column: &'static str) -> Result<i64, Status> {
+    i64_or_i32_as_i64(row.try_get::<_, i64>(column), || row.try_get::<_, i32>(column)).map_err(
+        |err| {
+            tracing::error!(column, error = %err, "failed to decode required ListCoins column");
+            Status::internal(format!("Failed to decode ListCoins row column '{column}'"))
+        },
+    )
+}
+
+fn row_to_coin_info(row: &Row) -> Result<proto::CoinInfo, Status> {
+    let coin: String = decode_required(row, "coin")?;
+    let fill_count: i64 = decode_required_count(row, "fill_count")?;
+
+    Ok(proto::CoinInfo { coin, fill_count })
+}
+
 fn row_to_fill(row: &Row) -> Result<proto::Fill, Status> {
     let time: NaiveDateTime = decode_required(row, "time")?;
     let block_time: Option<NaiveDateTime> = decode_optional(row, "block_time")?;
@@ -597,6 +632,28 @@ mod tests {
     fn get_fills_by_oid_sql_contains_expected_clauses() {
         assert!(GET_FILLS_BY_OID_SQL.contains("WHERE oid = $1"));
         assert!(GET_FILLS_BY_OID_SQL.ends_with("ORDER BY time ASC"));
+    }
+
+    #[test]
+    fn list_coins_sql_is_issue_22_exact() {
+        assert_eq!(
+            LIST_COINS_SQL,
+            "SELECT coin, count() AS fill_count FROM fills GROUP BY coin ORDER BY fill_count DESC"
+        );
+    }
+
+    #[test]
+    fn i64_or_i32_as_i64_prefers_i64_value() {
+        let value = i64_or_i32_as_i64::<&str>(Ok(42_i64), || Ok(7_i32))
+            .expect("i64 value should be preferred");
+        assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn i64_or_i32_as_i64_falls_back_to_i32_value() {
+        let value = i64_or_i32_as_i64::<&str>(Err("i64 decode failed"), || Ok(7_i32))
+            .expect("i32 fallback should decode");
+        assert_eq!(value, 7);
     }
 
     #[test]
