@@ -8,6 +8,7 @@ use aws_sdk_s3::types::RequestPayer;
 use aws_sdk_s3::Client;
 use chrono::{Duration, NaiveDate};
 use std::path::Path;
+use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 
 const DATE_FORMAT: &str = "%Y%m%d";
@@ -17,6 +18,26 @@ const DATE_FORMAT: &str = "%Y%m%d";
 pub enum DownloadOutcome {
     Downloaded,
     Missing,
+}
+
+#[derive(Debug, Error)]
+pub enum DownloadError {
+    #[error(
+        "failed to download s3://{bucket}/{key} due to AWS auth/permission error: {source}. Ensure AWS credentials are configured and have requester-pays GetObject access."
+    )]
+    Auth {
+        bucket: String,
+        key: String,
+        #[source]
+        source: anyhow::Error,
+    },
+    #[error("failed to download s3://{bucket}/{key}: {source}")]
+    Other {
+        bucket: String,
+        key: String,
+        #[source]
+        source: anyhow::Error,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,8 +106,22 @@ pub async fn download_file(
     config: &BackfillConfig,
     key: &str,
     dest: &str,
-) -> Result<DownloadOutcome> {
+) -> std::result::Result<DownloadOutcome, DownloadError> {
     let s3 = build_client().await;
+    let bucket = config.s3_bucket.clone();
+    let key_owned = key.to_owned();
+
+    let other_error = |source: anyhow::Error| DownloadError::Other {
+        bucket: bucket.clone(),
+        key: key_owned.clone(),
+        source,
+    };
+
+    let auth_error = |source: anyhow::Error| DownloadError::Auth {
+        bucket: bucket.clone(),
+        key: key_owned.clone(),
+        source,
+    };
 
     let response = s3
         .get_object()
@@ -108,18 +143,10 @@ pub async fn download_file(
                 return Ok(DownloadOutcome::Missing);
             }
             DownloadErrorClass::Auth => {
-                bail!(
-                    "Failed to download s3://{}/{} due to AWS auth/permission error: {}. \
-                     Ensure AWS credentials are configured and have requester-pays GetObject access.",
-                    config.s3_bucket,
-                    key,
-                    err
-                );
+                return Err(auth_error(anyhow::Error::new(err)));
             }
             DownloadErrorClass::Other => {
-                return Err(err).with_context(|| {
-                    format!("failed to download s3://{}/{}", config.s3_bucket, key)
-                });
+                return Err(other_error(anyhow::Error::new(err)));
             }
         },
     };
@@ -127,27 +154,34 @@ pub async fn download_file(
     let dest_path = Path::new(dest);
     if let Some(parent) = dest_path.parent() {
         if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent).await.with_context(|| {
-                format!(
-                    "failed to create destination directory {}",
-                    parent.display()
-                )
-            })?;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to create destination directory {}",
+                        parent.display()
+                    )
+                })
+                .map_err(|err| other_error(err))?;
         }
     }
 
     let mut file = tokio::fs::File::create(dest_path)
         .await
-        .with_context(|| format!("failed to create destination file {}", dest_path.display()))?;
+        .with_context(|| format!("failed to create destination file {}", dest_path.display()))
+        .map_err(|err| other_error(err))?;
 
     let mut body_reader = output.body.into_async_read();
     let bytes_written = tokio::io::copy(&mut body_reader, &mut file).await;
 
     match bytes_written {
         Ok(bytes_written) => {
-            file.flush().await.with_context(|| {
-                format!("failed to flush destination file {}", dest_path.display())
-            })?;
+            file.flush()
+                .await
+                .with_context(|| {
+                    format!("failed to flush destination file {}", dest_path.display())
+                })
+                .map_err(|err| other_error(err))?;
             tracing::info!(
                 "Downloaded s3://{}/{} -> {} ({} bytes)",
                 config.s3_bucket,
@@ -159,12 +193,11 @@ pub async fn download_file(
         }
         Err(err) => {
             let _ = tokio::fs::remove_file(dest_path).await;
-            Err(err).with_context(|| {
-                format!(
-                    "failed while writing downloaded object to {}",
-                    dest_path.display()
-                )
-            })
+            let source = anyhow::Error::new(err).context(format!(
+                "failed while writing downloaded object to {}",
+                dest_path.display()
+            ));
+            Err(other_error(source))
         }
     }
 }

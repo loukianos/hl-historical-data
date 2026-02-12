@@ -104,7 +104,8 @@ async fn main() -> anyhow::Result<()> {
                 let from = from.expect("--from required when not using --sync");
                 let to = to.expect("--to required when not using --sync");
                 tracing::info!("Backfilling from {} to {}", from, to);
-                backfill::run(&cfg, &from, &to).await?;
+                let report = backfill::run(&cfg, &from, &to).await?;
+                println!("{}", report.render(cfg.backfill.keep_temp_files));
             }
         }
         Commands::Admin { action } => {

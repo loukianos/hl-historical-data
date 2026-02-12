@@ -2,21 +2,23 @@ pub mod decompress;
 pub mod hour_window;
 pub mod ingest;
 pub mod parse;
+pub mod report;
 pub mod s3;
 pub mod status;
 
 use crate::config::Config;
 use crate::db::questdb::{QuestDbReader, QuestDbWriter};
 use anyhow::{Context, Result};
+use report::BackfillRunReport;
 use std::io::ErrorKind;
 use std::path::Path;
 
 /// Run backfill for a specific date range.
-pub async fn run(config: &Config, from: &str, to: &str) -> Result<()> {
+pub async fn run(config: &Config, from: &str, to: &str) -> Result<BackfillRunReport> {
     tracing::info!("Backfill from={} to={}", from, to);
 
     let keys = s3::generate_hourly_keys(&config.backfill.s3_prefix, from, to)?;
-    let total_hours = keys.len();
+    let mut report = BackfillRunReport::new(from, to, keys.len());
 
     // Ensure target tables exist before we start streaming hourly ingestion.
     let reader = QuestDbReader::new(&config.questdb);
@@ -26,21 +28,28 @@ pub async fn run(config: &Config, from: &str, to: &str) -> Result<()> {
         .context("failed to ensure QuestDB tables before backfill")?;
     let writer = QuestDbWriter::new(&config.questdb);
 
-    let mut files_missing = 0_usize;
-    let mut files_failed = 0_usize;
-    let mut files_succeeded = 0_usize;
-    let mut rows_inserted = 0_i64;
-    let mut rows_quarantined = 0_i64;
-    let mut parse_errors = 0_i64;
-
     for key in keys {
         let files = decompress::hour_files(&config.backfill.temp_dir, &key)
             .with_context(|| format!("failed to compute temp file paths for key {}", key))?;
 
         let lz4_dest = files.lz4_path.to_string_lossy().into_owned();
-        match s3::download_file(&config.backfill, &key, &lz4_dest).await? {
+        let download_outcome = match s3::download_file(&config.backfill, &key, &lz4_dest).await {
+            Ok(outcome) => outcome,
+            Err(err @ s3::DownloadError::Auth { .. }) => return Err(err.into()),
+            Err(err @ s3::DownloadError::Other { .. }) => {
+                tracing::warn!(
+                    key = %key,
+                    error = %err,
+                    "S3 download failed; skipping hour"
+                );
+                report.failed_download += 1;
+                continue;
+            }
+        };
+
+        match download_outcome {
             s3::DownloadOutcome::Missing => {
-                files_missing += 1;
+                report.hours_missing += 1;
                 continue;
             }
             s3::DownloadOutcome::Downloaded => {}
@@ -68,9 +77,17 @@ pub async fn run(config: &Config, from: &str, to: &str) -> Result<()> {
                             "Failed to clean up temporary file after decompression error"
                         );
                     }
+
+                    if let Err(cleanup_err) = cleanup_temp_file(&files.jsonl_path).await {
+                        tracing::warn!(
+                            path = %files.jsonl_path.display(),
+                            error = %cleanup_err,
+                            "Failed to clean up temporary JSONL file after decompression error"
+                        );
+                    }
                 }
 
-                files_failed += 1;
+                report.failed_decompress += 1;
                 continue;
             }
         };
@@ -110,7 +127,7 @@ pub async fn run(config: &Config, from: &str, to: &str) -> Result<()> {
                         }
                     }
 
-                    files_failed += 1;
+                    report.failed_dedup += 1;
                     continue;
                 }
             };
@@ -132,6 +149,22 @@ pub async fn run(config: &Config, from: &str, to: &str) -> Result<()> {
                     "JSONL ingest failed; skipping hour"
                 );
 
+                match delete_hour_rows_before_ingest(&reader, &key).await {
+                    Ok((rolled_back_fills, rolled_back_quarantine)) => {
+                        tracing::warn!(
+                            key = %key,
+                            rolled_back_fills,
+                            rolled_back_quarantine,
+                            "Rolled back hour rows after ingest failure"
+                        );
+                    }
+                    Err(rollback_err) => {
+                        return Err(rollback_err).with_context(|| {
+                            format!("failed to rollback hour {} after ingest failure", key)
+                        });
+                    }
+                }
+
                 if !config.backfill.keep_temp_files {
                     if let Err(cleanup_err) = cleanup_temp_file(&files.lz4_path).await {
                         tracing::warn!(
@@ -150,14 +183,14 @@ pub async fn run(config: &Config, from: &str, to: &str) -> Result<()> {
                     }
                 }
 
-                files_failed += 1;
+                report.failed_ingest += 1;
                 continue;
             }
         };
 
-        rows_inserted += ingest_stats.rows_inserted;
-        rows_quarantined += ingest_stats.rows_quarantined;
-        parse_errors += ingest_stats.parse_errors;
+        report.rows_inserted += ingest_stats.rows_inserted;
+        report.rows_quarantined += ingest_stats.rows_quarantined;
+        report.parse_errors += ingest_stats.parse_errors;
 
         tracing::info!(
             key = %key,
@@ -185,22 +218,26 @@ pub async fn run(config: &Config, from: &str, to: &str) -> Result<()> {
             }
         }
 
-        files_succeeded += 1;
+        report.hours_processed += 1;
     }
 
     tracing::info!(
-        total_hours,
-        files_succeeded,
-        files_missing,
-        files_failed,
-        rows_inserted,
-        rows_quarantined,
-        parse_errors,
+        hours_total = report.hours_total,
+        hours_processed = report.hours_processed,
+        hours_skipped = report.hours_skipped(),
+        files_missing = report.hours_missing,
+        failed_download = report.failed_download,
+        failed_decompress = report.failed_decompress,
+        failed_dedup = report.failed_dedup,
+        failed_ingest = report.failed_ingest,
+        rows_inserted = report.rows_inserted,
+        rows_quarantined = report.rows_quarantined,
+        parse_errors = report.parse_errors,
         keep_temp_files = config.backfill.keep_temp_files,
         "Backfill download+decompress+ingest pass finished"
     );
 
-    Ok(())
+    Ok(report)
 }
 
 async fn delete_hour_rows_before_ingest(reader: &QuestDbReader, key: &str) -> Result<(u64, u64)> {
