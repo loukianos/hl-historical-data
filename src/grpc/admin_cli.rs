@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::grpc::server::proto;
+use crate::grpc::proto;
 use anyhow::Result;
 
 pub async fn run(action: crate::AdminAction, config: &Config) -> Result<()> {

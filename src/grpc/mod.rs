@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod admin_cli;
+pub mod proto;
 pub mod queries;
 pub mod server;
 

@@ -1,6 +1,6 @@
 use crate::backfill::status::SharedBackfillStatus;
 use crate::config::Config;
-use crate::grpc::server::proto;
+use crate::grpc::proto;
 use tonic::{Request, Response, Status};
 
 pub struct AdminService {

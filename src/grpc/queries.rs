@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::grpc::server::proto;
+use crate::grpc::proto;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 

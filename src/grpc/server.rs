@@ -1,12 +1,9 @@
 use crate::backfill::status;
 use crate::config::Config;
 use crate::db::QuestDbReader;
+use crate::grpc::proto;
 use anyhow::Result;
 use tonic::transport::Server;
-
-pub mod proto {
-    tonic::include_proto!("hl_historical");
-}
 
 pub async fn run(config: Config) -> Result<()> {
     let addr = format!("{}:{}", config.grpc.host, config.grpc.port).parse()?;

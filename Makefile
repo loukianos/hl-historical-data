@@ -1,4 +1,6 @@
-.PHONY: up down logs reset build run serve backfill-sync proto-python
+.PHONY: up down logs reset build build-release run serve backfill-sync check proto-python sdk-install
+
+PYTHON ?= python3
 
 # ─── Docker Compose ──────────────────────────────────────────────────
 
@@ -39,8 +41,12 @@ check:
 
 proto-python:
 	cd src/clients/python/hl-historical-client && \
-	python3 -m grpc_tools.protoc \
+	GRPC_TOOLS_PROTO=$$($(PYTHON) -c "import grpc_tools, os; print(os.path.join(grpc_tools.__path__[0], '_proto'))") && \
+	mkdir -p src/hl_historical_client/proto && \
+	touch src/hl_historical_client/proto/__init__.py && \
+	$(PYTHON) -m grpc_tools.protoc \
 		-I../../../../proto \
+		-I$$GRPC_TOOLS_PROTO \
 		--python_out=src/hl_historical_client/proto \
 		--pyi_out=src/hl_historical_client/proto \
 		--grpc_python_out=src/hl_historical_client/proto \
