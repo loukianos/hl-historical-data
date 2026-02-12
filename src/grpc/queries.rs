@@ -15,6 +15,17 @@ const GET_FILLS_STREAM_BUFFER: usize = 128;
 const SIDE_UNSPECIFIED: i32 = 0;
 const SIDE_BUY: i32 = 1;
 const SIDE_SELL: i32 = 2;
+const INTERVAL_UNSPECIFIED: i32 = 0;
+const INTERVAL_1S: i32 = 1;
+const INTERVAL_5S: i32 = 2;
+const INTERVAL_30S: i32 = 3;
+const INTERVAL_1M: i32 = 4;
+const INTERVAL_5M: i32 = 5;
+const INTERVAL_15M: i32 = 6;
+const INTERVAL_30M: i32 = 7;
+const INTERVAL_1H: i32 = 8;
+const INTERVAL_4H: i32 = 9;
+const INTERVAL_1D: i32 = 10;
 
 const GET_FILLS_BASE_SQL: &str = concat!(
     "SELECT time, block_time, block_number, address, coin, type, px, sz, is_buy, ",
@@ -34,6 +45,10 @@ const GET_FILLS_BY_OID_SQL: &str = concat!(
     "fee_token, cloid, builder_fee, builder, local_time ",
     "FROM fills WHERE oid = $1 ORDER BY time ASC"
 );
+const GET_VWAP_BASE_SQL: &str = concat!(
+    "SELECT time, sum(px * sz) AS notional, sum(sz) AS volume, count() AS fill_count ",
+    "FROM fills WHERE time >= $1 AND time < $2 AND coin = $3"
+);
 const LIST_COINS_SQL: &str =
     "SELECT coin, count() AS fill_count FROM fills GROUP BY coin ORDER BY fill_count DESC";
 
@@ -45,6 +60,45 @@ struct ParsedGetFillsRequest {
     wallet: Option<String>,
     side_is_buy: Option<bool>,
     crossed_only: bool,
+}
+
+#[derive(Debug)]
+struct ParsedGetVwapRequest {
+    coin: String,
+    interval: SampleByInterval,
+    start_time: NaiveDateTime,
+    end_time: NaiveDateTime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SampleByInterval {
+    S1,
+    S5,
+    S30,
+    M1,
+    M5,
+    M15,
+    M30,
+    H1,
+    H4,
+    D1,
+}
+
+impl SampleByInterval {
+    fn as_questdb(self) -> &'static str {
+        match self {
+            Self::S1 => "1s",
+            Self::S5 => "5s",
+            Self::S30 => "30s",
+            Self::M1 => "1m",
+            Self::M5 => "5m",
+            Self::M15 => "15m",
+            Self::M30 => "30m",
+            Self::H1 => "1h",
+            Self::H4 => "4h",
+            Self::D1 => "1d",
+        }
+    }
 }
 
 pub struct QueryService {
@@ -213,10 +267,58 @@ impl proto::historical_data_service_server::HistoricalDataService for QueryServi
 
     async fn get_vwap(
         &self,
-        _request: Request<proto::GetVwapRequest>,
+        request: Request<proto::GetVwapRequest>,
     ) -> Result<Response<Self::GetVWAPStream>, Status> {
-        // TODO: implement query
-        Err(Status::unimplemented("GetVWAP not yet implemented"))
+        let parsed = parse_get_vwap_request(request.into_inner())?;
+        let sql = build_get_vwap_sql(parsed.interval);
+        let params: Vec<&(dyn ToSql + Sync)> =
+            vec![&parsed.start_time, &parsed.end_time, &parsed.coin];
+
+        let reader = QuestDbReader::new(&self.config.questdb);
+        let mut row_stream = reader
+            .query_stream(&sql, &params)
+            .await
+            .map_err(|err| map_query_start_error("GetVWAP", err))?;
+
+        let (tx, rx) = mpsc::channel(GET_FILLS_STREAM_BUFFER);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tx.closed() => return,
+                    next_row = row_stream.next() => {
+                        match next_row {
+                            Some(Ok(row)) => match row_to_vwap_point(&row) {
+                                Ok(point) => {
+                                    if tx
+                                        .send(Ok(proto::GetVwapResponse { point: Some(point) }))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                Err(status) => {
+                                    let _ = tx.send(Err(status)).await;
+                                    return;
+                                }
+                            },
+                            Some(Err(err)) => {
+                                tracing::error!(error = %err, "GetVWAP row stream failed");
+                                let _ = tx
+                                    .send(Err(Status::unavailable(
+                                        "QuestDB stream error during GetVWAP query",
+                                    )))
+                                    .await;
+                                return;
+                            }
+                            None => return,
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     type GetTimeBarsStream = ReceiverStream<Result<proto::GetTimeBarsResponse, Status>>;
@@ -269,7 +371,9 @@ fn map_query_start_error(operation: &'static str, err: anyhow::Error) -> Status 
         return Status::internal(format!("{operation} query failed due to a database error"));
     }
 
-    Status::unavailable(format!("QuestDB unavailable while starting {operation} query"))
+    Status::unavailable(format!(
+        "QuestDB unavailable while starting {operation} query"
+    ))
 }
 
 fn parse_get_fills_request(
@@ -293,6 +397,26 @@ fn parse_get_fills_request(
         wallet: normalize_optional_string(request.wallet, "wallet")?,
         side_is_buy: parse_side_filter(request.side)?,
         crossed_only: request.crossed_only.unwrap_or(false),
+    })
+}
+
+fn parse_get_vwap_request(request: proto::GetVwapRequest) -> Result<ParsedGetVwapRequest, Status> {
+    let start_ts = require_non_zero_timestamp(request.start_time, "start_time")?;
+    let end_ts = require_non_zero_timestamp(request.end_time, "end_time")?;
+
+    let start_time = timestamp_to_naive(&start_ts, "start_time")?;
+    let end_time = timestamp_to_naive(&end_ts, "end_time")?;
+    if start_time >= end_time {
+        return Err(Status::invalid_argument(
+            "start_time must be strictly earlier than end_time",
+        ));
+    }
+
+    Ok(ParsedGetVwapRequest {
+        coin: normalize_required_string(request.coin, "coin")?,
+        interval: parse_interval(request.interval)?,
+        start_time,
+        end_time,
     })
 }
 
@@ -390,6 +514,25 @@ fn parse_side_filter(side: Option<i32>) -> Result<Option<bool>, Status> {
     }
 }
 
+fn parse_interval(interval: i32) -> Result<SampleByInterval, Status> {
+    match interval {
+        INTERVAL_UNSPECIFIED => Err(Status::invalid_argument("interval must be specified")),
+        INTERVAL_1S => Ok(SampleByInterval::S1),
+        INTERVAL_5S => Ok(SampleByInterval::S5),
+        INTERVAL_30S => Ok(SampleByInterval::S30),
+        INTERVAL_1M => Ok(SampleByInterval::M1),
+        INTERVAL_5M => Ok(SampleByInterval::M5),
+        INTERVAL_15M => Ok(SampleByInterval::M15),
+        INTERVAL_30M => Ok(SampleByInterval::M30),
+        INTERVAL_1H => Ok(SampleByInterval::H1),
+        INTERVAL_4H => Ok(SampleByInterval::H4),
+        INTERVAL_1D => Ok(SampleByInterval::D1),
+        raw => Err(Status::invalid_argument(format!(
+            "interval has unknown enum value: {raw}"
+        ))),
+    }
+}
+
 fn build_get_fills_sql(
     has_coin: bool,
     has_wallet: bool,
@@ -421,6 +564,13 @@ fn build_get_fills_sql(
     sql
 }
 
+fn build_get_vwap_sql(interval: SampleByInterval) -> String {
+    format!(
+        "{GET_VWAP_BASE_SQL} SAMPLE BY {} ORDER BY time ASC",
+        interval.as_questdb()
+    )
+}
+
 fn decode_required<T>(row: &Row, column: &'static str) -> Result<T, Status>
 where
     for<'a> T: FromSql<'a>,
@@ -449,12 +599,13 @@ fn i64_or_i32_as_i64<E>(
 }
 
 fn decode_required_count(row: &Row, column: &'static str) -> Result<i64, Status> {
-    i64_or_i32_as_i64(row.try_get::<_, i64>(column), || row.try_get::<_, i32>(column)).map_err(
-        |err| {
-            tracing::error!(column, error = %err, "failed to decode required ListCoins column");
-            Status::internal(format!("Failed to decode ListCoins row column '{column}'"))
-        },
-    )
+    i64_or_i32_as_i64(row.try_get::<_, i64>(column), || {
+        row.try_get::<_, i32>(column)
+    })
+    .map_err(|err| {
+        tracing::error!(column, error = %err, "failed to decode required count column");
+        Status::internal(format!("Failed to decode row column '{column}'"))
+    })
 }
 
 fn row_to_coin_info(row: &Row) -> Result<proto::CoinInfo, Status> {
@@ -462,6 +613,29 @@ fn row_to_coin_info(row: &Row) -> Result<proto::CoinInfo, Status> {
     let fill_count: i64 = decode_required_count(row, "fill_count")?;
 
     Ok(proto::CoinInfo { coin, fill_count })
+}
+
+fn compute_vwap(notional: f64, volume: f64) -> f64 {
+    if volume == 0.0 {
+        0.0
+    } else {
+        notional / volume
+    }
+}
+
+fn row_to_vwap_point(row: &Row) -> Result<proto::VwapPoint, Status> {
+    let time: NaiveDateTime = decode_required(row, "time")?;
+    let notional: f64 = decode_optional(row, "notional")?.unwrap_or(0.0);
+    let volume: f64 = decode_optional(row, "volume")?.unwrap_or(0.0);
+    let fill_count: i64 = decode_required_count(row, "fill_count")?;
+
+    Ok(proto::VwapPoint {
+        time: Some(naive_to_timestamp(time)),
+        vwap: compute_vwap(notional, volume),
+        volume,
+        notional,
+        fill_count,
+    })
 }
 
 fn row_to_fill(row: &Row) -> Result<proto::Fill, Status> {
@@ -546,8 +720,8 @@ mod tests {
 
     #[test]
     fn normalize_required_string_trims_values() {
-        let hash =
-            normalize_required_string(" 0xabc123 ".to_string(), "hash").expect("hash should normalize");
+        let hash = normalize_required_string(" 0xabc123 ".to_string(), "hash")
+            .expect("hash should normalize");
         assert_eq!(hash, "0xabc123");
     }
 
@@ -704,6 +878,94 @@ mod tests {
         assert_eq!(parsed.wallet.as_deref(), Some("0xabc"));
         assert_eq!(parsed.side_is_buy, Some(true));
         assert!(parsed.crossed_only);
+    }
+
+    #[test]
+    fn parse_interval_maps_enum_values() {
+        assert_eq!(
+            parse_interval(INTERVAL_1S).expect("1s should parse"),
+            SampleByInterval::S1
+        );
+        assert_eq!(
+            parse_interval(INTERVAL_5M).expect("5m should parse"),
+            SampleByInterval::M5
+        );
+        assert_eq!(
+            parse_interval(INTERVAL_1D).expect("1d should parse"),
+            SampleByInterval::D1
+        );
+    }
+
+    #[test]
+    fn parse_interval_rejects_unspecified_and_unknown_values() {
+        let unspecified =
+            parse_interval(INTERVAL_UNSPECIFIED).expect_err("unspecified should fail");
+        assert_eq!(unspecified.code(), tonic::Code::InvalidArgument);
+
+        let unknown = parse_interval(99).expect_err("unknown should fail");
+        assert_eq!(unknown.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn parse_get_vwap_request_rejects_blank_coin() {
+        let request = proto::GetVwapRequest {
+            coin: "   ".to_string(),
+            interval: INTERVAL_1M,
+            start_time: Some(ts(100, 0)),
+            end_time: Some(ts(200, 0)),
+        };
+
+        let err = parse_get_vwap_request(request).expect_err("blank coin should fail");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn parse_get_vwap_request_rejects_invalid_time_order() {
+        let request = proto::GetVwapRequest {
+            coin: "BTC".to_string(),
+            interval: INTERVAL_5M,
+            start_time: Some(ts(200, 0)),
+            end_time: Some(ts(200, 0)),
+        };
+
+        let err = parse_get_vwap_request(request).expect_err("start == end should fail");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn parse_get_vwap_request_accepts_valid_payload() {
+        let request = proto::GetVwapRequest {
+            coin: " BTC ".to_string(),
+            interval: INTERVAL_30S,
+            start_time: Some(ts(1_737_600_000, 0)),
+            end_time: Some(ts(1_737_600_100, 0)),
+        };
+
+        let parsed = parse_get_vwap_request(request).expect("request should parse");
+        assert_eq!(parsed.coin, "BTC");
+        assert_eq!(parsed.interval, SampleByInterval::S30);
+        assert!(parsed.start_time < parsed.end_time);
+    }
+
+    #[test]
+    fn build_get_vwap_sql_includes_sample_by_and_ordering() {
+        let sql = build_get_vwap_sql(SampleByInterval::M15);
+        assert!(sql.contains("time >= $1 AND time < $2 AND coin = $3"));
+        assert!(sql.contains("sum(px * sz) AS notional"));
+        assert!(sql.contains("sum(sz) AS volume"));
+        assert!(sql.contains("count() AS fill_count"));
+        assert!(sql.contains("SAMPLE BY 15m"));
+        assert!(sql.ends_with("ORDER BY time ASC"));
+    }
+
+    #[test]
+    fn compute_vwap_guards_division_by_zero() {
+        assert_eq!(compute_vwap(10.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn compute_vwap_matches_manual_division() {
+        assert_eq!(compute_vwap(105.0, 2.0), 52.5);
     }
 
     #[test]
