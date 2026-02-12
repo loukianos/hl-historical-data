@@ -36,13 +36,13 @@ impl QuestDbReader {
 
     /// Create fills and fills_quarantine tables if they don't exist.
     ///
-    /// Column-type choices for now (to be finalized in Issue 6 ADR):
+    /// Type/index rationale is documented in `docs/adr/0001-questdb-types.md`:
     /// - TIMESTAMP: all temporal fields
     /// - DOUBLE: price/size/fee/pnl numeric fields
     /// - LONG: IDs and block numbers
     /// - BOOLEAN: logical flags
-    /// - SYMBOL: low-cardinality/query-heavy dimensions (`coin`, `type`, `fee_token`, `address`)
-    /// - VARCHAR: high-cardinality/unbounded strings (`hash`, `cloid`, `builder*`, quarantine `reason`)
+    /// - SYMBOL: low-cardinality/query-heavy dimensions in `fills`
+    /// - VARCHAR: high-cardinality/unbounded strings to avoid symbol-table explosion
     pub async fn ensure_tables(&self) -> Result<()> {
         let client = self.connect().await?;
 
@@ -101,7 +101,7 @@ impl QuestDbReader {
                     builder_fee VARCHAR,
                     builder VARCHAR,
                     local_time TIMESTAMP,
-                    reason VARCHAR
+                    reason SYMBOL
                 ) TIMESTAMP(time) PARTITION BY DAY;",
                 &[],
             )
