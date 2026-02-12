@@ -35,6 +35,14 @@ impl QuestDbReader {
     }
 
     /// Create fills and fills_quarantine tables if they don't exist.
+    ///
+    /// Column-type choices for now (to be finalized in Issue 6 ADR):
+    /// - TIMESTAMP: all temporal fields
+    /// - DOUBLE: price/size/fee/pnl numeric fields
+    /// - LONG: IDs and block numbers
+    /// - BOOLEAN: logical flags
+    /// - SYMBOL: low-cardinality/query-heavy dimensions (`coin`, `type`, `fee_token`, `address`)
+    /// - VARCHAR: high-cardinality/unbounded strings (`hash`, `cloid`, `builder*`, quarantine `reason`)
     pub async fn ensure_tables(&self) -> Result<()> {
         let client = self.connect().await?;
 
@@ -44,8 +52,8 @@ impl QuestDbReader {
                     time TIMESTAMP,
                     block_time TIMESTAMP,
                     block_number LONG,
-                    address SYMBOL,
-                    coin SYMBOL,
+                    address SYMBOL INDEX,
+                    coin SYMBOL INDEX,
                     type SYMBOL,
                     px DOUBLE,
                     sz DOUBLE,
@@ -99,6 +107,10 @@ impl QuestDbReader {
             )
             .await?;
 
+        // Best effort: if table already existed without indexes, try to add them.
+        ensure_symbol_index(&client, "fills", "coin").await?;
+        ensure_symbol_index(&client, "fills", "address").await?;
+
         tracing::info!("QuestDB tables ensured");
         Ok(())
     }
@@ -107,6 +119,25 @@ impl QuestDbReader {
 /// QuestDB writer via InfluxDB Line Protocol (port 9009).
 pub struct QuestDbWriter {
     config: QuestDbConfig,
+}
+
+async fn ensure_symbol_index(
+    client: &tokio_postgres::Client,
+    table: &str,
+    column: &str,
+) -> Result<()> {
+    let sql = format!("ALTER TABLE {table} ALTER COLUMN {column} ADD INDEX");
+    if let Err(err) = client.execute(&sql, &[]).await {
+        let msg = err.to_string().to_ascii_lowercase();
+        if msg.contains("already") || msg.contains("exists") {
+            tracing::debug!("Index already exists for {}.{}", table, column);
+            return Ok(());
+        }
+        return Err(err.into());
+    }
+
+    tracing::info!("Ensured index on {}.{}", table, column);
+    Ok(())
 }
 
 impl QuestDbWriter {
