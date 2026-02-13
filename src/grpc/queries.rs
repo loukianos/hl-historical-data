@@ -57,6 +57,21 @@ const GET_TIME_BARS_BASE_SQL: &str = concat!(
     "sum(CASE WHEN is_buy = false THEN sz ELSE 0.0 END) AS sell_volume ",
     "FROM fills WHERE time >= $1 AND time < $2 AND coin = $3 AND crossed = true"
 );
+const GET_WALLET_SUMMARY_PER_COIN_SQL: &str = concat!(
+    "SELECT coin, ",
+    "sum(sz) AS volume, ",
+    "sum(px * sz) AS notional_volume, ",
+    "count() AS fill_count, ",
+    "sum(CASE WHEN crossed = false THEN 1 ELSE 0 END) AS maker_count, ",
+    "sum(CASE WHEN crossed = true THEN 1 ELSE 0 END) AS taker_count ",
+    "FROM fills ",
+    "WHERE time >= $1 AND time < $2 AND address = $3 ",
+    "GROUP BY coin ORDER BY fill_count DESC, coin ASC"
+);
+const GET_WALLET_SUMMARY_TIME_BOUNDS_SQL: &str = concat!(
+    "SELECT min(time) AS first_fill_time, max(time) AS last_fill_time ",
+    "FROM fills WHERE time >= $1 AND time < $2 AND address = $3"
+);
 const LIST_COINS_SQL: &str =
     "SELECT coin, count() AS fill_count FROM fills GROUP BY coin ORDER BY fill_count DESC";
 
@@ -82,6 +97,13 @@ struct ParsedGetVwapRequest {
 struct ParsedGetTimeBarsRequest {
     coin: String,
     interval: SampleByInterval,
+    start_time: NaiveDateTime,
+    end_time: NaiveDateTime,
+}
+
+#[derive(Debug)]
+struct ParsedGetWalletSummaryRequest {
+    wallet: String,
     start_time: NaiveDateTime,
     end_time: NaiveDateTime,
 }
@@ -397,12 +419,56 @@ impl proto::historical_data_service_server::HistoricalDataService for QueryServi
 
     async fn get_wallet_summary(
         &self,
-        _request: Request<proto::GetWalletSummaryRequest>,
+        request: Request<proto::GetWalletSummaryRequest>,
     ) -> Result<Response<proto::GetWalletSummaryResponse>, Status> {
-        // TODO: implement query
-        Err(Status::unimplemented(
-            "GetWalletSummary not yet implemented",
-        ))
+        let parsed = parse_get_wallet_summary_request(request.into_inner())?;
+        let params: Vec<&(dyn ToSql + Sync)> =
+            vec![&parsed.start_time, &parsed.end_time, &parsed.wallet];
+
+        let reader = QuestDbReader::new(&self.config.questdb);
+        let rows = reader
+            .query(GET_WALLET_SUMMARY_PER_COIN_SQL, &params)
+            .await
+            .map_err(|err| map_query_start_error("GetWalletSummary", err))?;
+
+        let per_coin = rows
+            .iter()
+            .map(row_to_coin_summary)
+            .collect::<Result<Vec<_>, Status>>()?;
+
+        let fill_count: i64 = per_coin.iter().map(|entry| entry.fill_count).sum();
+        let unique_coins = per_coin.len() as i64;
+        let total_volume: f64 = per_coin.iter().map(|entry| entry.volume).sum();
+        let total_notional: f64 = per_coin.iter().map(|entry| entry.notional_volume).sum();
+        let maker_count: i64 = per_coin.iter().map(|entry| entry.maker_count).sum();
+        let taker_count: i64 = per_coin.iter().map(|entry| entry.taker_count).sum();
+        let maker_taker_ratio = compute_maker_taker_ratio(maker_count, taker_count);
+
+        let (first_fill_time, last_fill_time) = if per_coin.is_empty() {
+            (None, None)
+        } else {
+            let row = reader
+                .query_one(GET_WALLET_SUMMARY_TIME_BOUNDS_SQL, &params)
+                .await
+                .map_err(|err| map_query_start_error("GetWalletSummary", err))?;
+
+            let first_fill_time: Option<NaiveDateTime> = decode_optional(&row, "first_fill_time")?;
+            let last_fill_time: Option<NaiveDateTime> = decode_optional(&row, "last_fill_time")?;
+            (first_fill_time, last_fill_time)
+        };
+
+        Ok(Response::new(proto::GetWalletSummaryResponse {
+            fill_count,
+            unique_coins,
+            total_volume,
+            total_notional,
+            maker_count,
+            taker_count,
+            maker_taker_ratio,
+            first_fill_time: first_fill_time.map(naive_to_timestamp),
+            last_fill_time: last_fill_time.map(naive_to_timestamp),
+            per_coin,
+        }))
     }
 
     async fn list_coins(
@@ -501,6 +567,27 @@ fn parse_get_time_bars_request(
     Ok(ParsedGetTimeBarsRequest {
         coin: normalize_required_string(request.coin, "coin")?,
         interval: parse_interval(request.interval)?,
+        start_time,
+        end_time,
+    })
+}
+
+fn parse_get_wallet_summary_request(
+    request: proto::GetWalletSummaryRequest,
+) -> Result<ParsedGetWalletSummaryRequest, Status> {
+    let start_ts = require_non_zero_timestamp(request.start_time, "start_time")?;
+    let end_ts = require_non_zero_timestamp(request.end_time, "end_time")?;
+
+    let start_time = timestamp_to_naive(&start_ts, "start_time")?;
+    let end_time = timestamp_to_naive(&end_ts, "end_time")?;
+    if start_time >= end_time {
+        return Err(Status::invalid_argument(
+            "start_time must be strictly earlier than end_time",
+        ));
+    }
+
+    Ok(ParsedGetWalletSummaryRequest {
+        wallet: normalize_required_string(request.wallet, "wallet")?,
         start_time,
         end_time,
     })
@@ -692,13 +779,42 @@ fn i64_or_i32_as_i64<E>(
 }
 
 fn decode_required_count(row: &Row, column: &'static str) -> Result<i64, Status> {
-    i64_or_i32_as_i64(row.try_get::<_, i64>(column), || {
+    match i64_or_i32_as_i64(row.try_get::<_, i64>(column), || {
         row.try_get::<_, i32>(column)
-    })
-    .map_err(|err| {
-        tracing::error!(column, error = %err, "failed to decode required count column");
-        Status::internal(format!("Failed to decode row column '{column}'"))
-    })
+    }) {
+        Ok(value) => Ok(value),
+        Err(i64_or_i32_err) => {
+            let value: f64 = row.try_get(column).map_err(|f64_err| {
+                tracing::error!(
+                    column,
+                    i64_or_i32_error = %i64_or_i32_err,
+                    f64_error = %f64_err,
+                    "failed to decode required count column"
+                );
+                Status::internal(format!("Failed to decode row column '{column}'"))
+            })?;
+
+            if !value.is_finite() || value.fract() != 0.0 {
+                tracing::error!(
+                    column,
+                    value,
+                    "count column decoded as non-integral floating-point value"
+                );
+                return Err(Status::internal(format!(
+                    "Failed to decode row column '{column}'"
+                )));
+            }
+
+            if value < i64::MIN as f64 || value > i64::MAX as f64 {
+                tracing::error!(column, value, "count column value is out of i64 range");
+                return Err(Status::internal(format!(
+                    "Failed to decode row column '{column}'"
+                )));
+            }
+
+            Ok(value as i64)
+        }
+    }
 }
 
 fn row_to_coin_info(row: &Row) -> Result<proto::CoinInfo, Status> {
@@ -706,6 +822,33 @@ fn row_to_coin_info(row: &Row) -> Result<proto::CoinInfo, Status> {
     let fill_count: i64 = decode_required_count(row, "fill_count")?;
 
     Ok(proto::CoinInfo { coin, fill_count })
+}
+
+fn row_to_coin_summary(row: &Row) -> Result<proto::CoinSummary, Status> {
+    let coin: String = decode_required(row, "coin")?;
+    let volume: f64 = decode_optional(row, "volume")?.unwrap_or(0.0);
+    let notional_volume: f64 = decode_optional(row, "notional_volume")?.unwrap_or(0.0);
+    let fill_count: i64 = decode_required_count(row, "fill_count")?;
+    let maker_count: i64 = decode_required_count(row, "maker_count")?;
+    let taker_count: i64 = decode_required_count(row, "taker_count")?;
+
+    Ok(proto::CoinSummary {
+        coin,
+        volume,
+        notional_volume,
+        fill_count,
+        maker_count,
+        taker_count,
+        maker_taker_ratio: compute_maker_taker_ratio(maker_count, taker_count),
+    })
+}
+
+fn compute_maker_taker_ratio(maker_count: i64, taker_count: i64) -> f64 {
+    if taker_count == 0 {
+        0.0
+    } else {
+        maker_count as f64 / taker_count as f64
+    }
 }
 
 fn compute_vwap(notional: f64, volume: f64) -> f64 {
@@ -1108,6 +1251,64 @@ mod tests {
     }
 
     #[test]
+    fn parse_get_wallet_summary_request_rejects_blank_wallet() {
+        let request = proto::GetWalletSummaryRequest {
+            wallet: "   ".to_string(),
+            start_time: Some(ts(100, 0)),
+            end_time: Some(ts(200, 0)),
+        };
+
+        let err = parse_get_wallet_summary_request(request).expect_err("blank wallet should fail");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn parse_get_wallet_summary_request_rejects_invalid_time_order() {
+        let request = proto::GetWalletSummaryRequest {
+            wallet: "0xabc".to_string(),
+            start_time: Some(ts(200, 0)),
+            end_time: Some(ts(200, 0)),
+        };
+
+        let err = parse_get_wallet_summary_request(request).expect_err("start == end should fail");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn parse_get_wallet_summary_request_accepts_valid_payload() {
+        let request = proto::GetWalletSummaryRequest {
+            wallet: " 0xabc ".to_string(),
+            start_time: Some(ts(1_737_600_000, 0)),
+            end_time: Some(ts(1_737_600_100, 0)),
+        };
+
+        let parsed = parse_get_wallet_summary_request(request).expect("request should parse");
+        assert_eq!(parsed.wallet, "0xabc");
+        assert!(parsed.start_time < parsed.end_time);
+    }
+
+    #[test]
+    fn build_get_wallet_summary_per_coin_sql_has_expected_clauses() {
+        assert!(GET_WALLET_SUMMARY_PER_COIN_SQL.contains("sum(sz) AS volume"));
+        assert!(GET_WALLET_SUMMARY_PER_COIN_SQL.contains("sum(px * sz) AS notional_volume"));
+        assert!(GET_WALLET_SUMMARY_PER_COIN_SQL.contains("count() AS fill_count"));
+        assert!(GET_WALLET_SUMMARY_PER_COIN_SQL.contains("crossed = false"));
+        assert!(GET_WALLET_SUMMARY_PER_COIN_SQL.contains("crossed = true"));
+        assert!(
+            GET_WALLET_SUMMARY_PER_COIN_SQL.contains("time >= $1 AND time < $2 AND address = $3")
+        );
+        assert!(GET_WALLET_SUMMARY_PER_COIN_SQL.contains("GROUP BY coin"));
+    }
+
+    #[test]
+    fn build_get_wallet_summary_time_bounds_sql_has_expected_clauses() {
+        assert!(GET_WALLET_SUMMARY_TIME_BOUNDS_SQL.contains("min(time) AS first_fill_time"));
+        assert!(GET_WALLET_SUMMARY_TIME_BOUNDS_SQL.contains("max(time) AS last_fill_time"));
+        assert!(GET_WALLET_SUMMARY_TIME_BOUNDS_SQL
+            .contains("time >= $1 AND time < $2 AND address = $3"));
+    }
+
+    #[test]
     fn build_get_vwap_sql_includes_sample_by_and_ordering() {
         let sql = build_get_vwap_sql(SampleByInterval::M15);
         assert!(sql.contains("time >= $1 AND time < $2 AND coin = $3"));
@@ -1139,6 +1340,16 @@ mod tests {
     #[test]
     fn compute_vwap_guards_division_by_zero() {
         assert_eq!(compute_vwap(10.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn compute_maker_taker_ratio_guards_division_by_zero() {
+        assert_eq!(compute_maker_taker_ratio(10, 0), 0.0);
+    }
+
+    #[test]
+    fn compute_maker_taker_ratio_matches_manual_division() {
+        assert_eq!(compute_maker_taker_ratio(9, 3), 3.0);
     }
 
     #[test]
