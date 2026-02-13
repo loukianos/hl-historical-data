@@ -29,3 +29,36 @@ make proto-python
 ```
 
 If your proto file is in a non-standard location, set `HL_HISTORICAL_PROTO_PATH=/absolute/path/to/hl_historical.proto`.
+
+## Usage
+
+```python
+from datetime import datetime
+
+from hl_historical_client import HistoricalDataClient
+
+with HistoricalDataClient(host="127.0.0.1", port=50051) as client:
+    fills = client.get_fills(
+        start=datetime(2025, 1, 1, 0, 0, 0),
+        end=datetime(2025, 1, 2, 0, 0, 0),
+        coin="BTC",
+    )
+
+    vwap = client.get_vwap(
+        coin="BTC",
+        interval="1m",
+        start=datetime(2025, 1, 1, 0, 0, 0),
+        end=datetime(2025, 1, 2, 0, 0, 0),
+    )
+
+    summary = client.get_wallet_summary(
+        wallet="0x...",
+        start=datetime(2025, 1, 1, 0, 0, 0),
+        end=datetime(2025, 1, 2, 0, 0, 0),
+    )
+    # summary["summary"] and summary["per_coin"] are Polars DataFrames
+```
+
+All query methods return Polars DataFrames. Naive datetimes are treated as UTC.
+
+Supported intervals: `1s`, `5s`, `30s`, `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`.
