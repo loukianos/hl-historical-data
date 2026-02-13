@@ -62,3 +62,13 @@ with HistoricalDataClient(host="127.0.0.1", port=50051) as client:
 All query methods return Polars DataFrames. Naive datetimes are treated as UTC.
 
 Supported intervals: `1s`, `5s`, `30s`, `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`.
+
+## Research machine setup
+
+From the repository root, you can bootstrap a full Python research environment (venv + SDK + optional Jupyter kernel):
+
+```bash
+bash scripts/setup_python_research_env.sh --with-jupyter
+```
+
+For workflow guidance, see `docs/python-research-workflow.md`.

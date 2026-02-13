@@ -45,6 +45,16 @@ cargo run -- admin purge --before 20250801 --config config.toml
 cargo run -- admin reindex --config config.toml
 ```
 
+## Python research environment
+
+Use the setup script to create a repo-local virtual environment and install Python SDK dependencies:
+
+```bash
+bash scripts/setup_python_research_env.sh --with-jupyter
+```
+
+See [`docs/python-research-workflow.md`](docs/python-research-workflow.md) for full environment management + notebook workflow guidance.
+
 ## Development checks
 
 ```bash

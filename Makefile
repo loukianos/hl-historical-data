@@ -1,4 +1,4 @@
-.PHONY: up down logs reset build build-release run serve backfill-sync check proto-python sdk-install
+.PHONY: up down logs reset build build-release run serve backfill-sync check proto-python sdk-install python-env python-env-jupyter
 
 PYTHON ?= python3
 
@@ -45,3 +45,9 @@ proto-python:
 
 sdk-install:
 	pip install -e src/clients/python/hl-historical-client
+
+python-env:
+	bash scripts/setup_python_research_env.sh
+
+python-env-jupyter:
+	bash scripts/setup_python_research_env.sh --with-jupyter
