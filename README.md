@@ -34,6 +34,17 @@ cargo run -- serve --config config.toml
 cargo run -- backfill --from 20250727 --to 20250727 --config config.toml
 ```
 
+6. Run admin commands (requires `serve` to be running):
+
+```bash
+cargo run -- admin status --config config.toml
+cargo run -- admin stats --config config.toml
+cargo run -- admin sync --config config.toml
+cargo run -- admin backfill --from 20250727 --to 20250728 --config config.toml
+cargo run -- admin purge --before 20250801 --config config.toml
+cargo run -- admin reindex --config config.toml
+```
+
 ## Development checks
 
 ```bash
