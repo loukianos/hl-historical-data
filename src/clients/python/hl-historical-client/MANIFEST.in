@@ -1,0 +1,2 @@
+include proto/hl_historical.proto
+recursive-include src/hl_historical_client *.pyi py.typed

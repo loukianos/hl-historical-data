@@ -20,7 +20,8 @@ build/
 venv/
 
 # Generated Python protobuf stubs
-src/clients/python/hl-historical-client/src/hl_historical_client/proto/
+src/clients/python/hl-historical-client/src/hl_historical_client/proto/*
+!src/clients/python/hl-historical-client/src/hl_historical_client/proto/__init__.py
 
 # IDE
 .idea/

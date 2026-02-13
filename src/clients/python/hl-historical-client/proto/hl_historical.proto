@@ -1,0 +1,259 @@
+syntax = "proto3";
+
+package hl_historical;
+
+import "google/protobuf/timestamp.proto";
+
+// ─── Enums ──────────────────────────────────────────────────────────
+
+enum Side {
+  SIDE_UNSPECIFIED = 0;
+  SIDE_BUY = 1;
+  SIDE_SELL = 2;
+}
+
+enum Interval {
+  INTERVAL_UNSPECIFIED = 0;
+  INTERVAL_1S = 1;
+  INTERVAL_5S = 2;
+  INTERVAL_30S = 3;
+  INTERVAL_1M = 4;
+  INTERVAL_5M = 5;
+  INTERVAL_15M = 6;
+  INTERVAL_30M = 7;
+  INTERVAL_1H = 8;
+  INTERVAL_4H = 9;
+  INTERVAL_1D = 10;
+}
+
+// ─── Messages ───────────────────────────────────────────────────────
+
+message Fill {
+  google.protobuf.Timestamp time = 1;
+  google.protobuf.Timestamp block_time = 2;
+  int64 block_number = 3;
+  string address = 4;
+  string coin = 5;
+  string type = 6;
+  double px = 7;
+  double sz = 8;
+  bool is_buy = 9;
+  double start_position = 10;
+  bool is_gaining_inventory = 11;
+  double closed_pnl = 12;
+  string hash = 13;
+  int64 oid = 14;
+  bool crossed = 15;
+  double fee = 16;
+  int64 tid = 17;
+  string fee_token = 18;
+  optional string cloid = 19;
+  optional string builder_fee = 20;
+  optional string builder = 21;
+  google.protobuf.Timestamp local_time = 22;
+}
+
+message TimeRange {
+  google.protobuf.Timestamp start_time = 1;
+  google.protobuf.Timestamp end_time = 2;
+}
+
+// ─── Core Query RPCs ────────────────────────────────────────────────
+
+message GetFillsRequest {
+  google.protobuf.Timestamp start_time = 1;
+  google.protobuf.Timestamp end_time = 2;
+  optional string coin = 3;
+  optional string wallet = 4;
+  optional Side side = 5;
+  optional bool crossed_only = 6;
+}
+
+message GetFillsResponse {
+  Fill fill = 1;
+}
+
+message GetFillByHashRequest {
+  string hash = 1;
+}
+
+message GetFillByHashResponse {
+  repeated Fill fills = 1;
+}
+
+message GetFillsByOidRequest {
+  int64 oid = 1;
+}
+
+message GetFillsByOidResponse {
+  Fill fill = 1;
+}
+
+message GetVWAPRequest {
+  string coin = 1;
+  Interval interval = 2;
+  google.protobuf.Timestamp start_time = 3;
+  google.protobuf.Timestamp end_time = 4;
+}
+
+message VWAPPoint {
+  google.protobuf.Timestamp time = 1;
+  double vwap = 2;
+  double volume = 3;
+  double notional = 4;
+  int64 fill_count = 5;
+}
+
+message GetVWAPResponse {
+  VWAPPoint point = 1;
+}
+
+message GetTimeBarsRequest {
+  string coin = 1;
+  Interval interval = 2;
+  google.protobuf.Timestamp start_time = 3;
+  google.protobuf.Timestamp end_time = 4;
+}
+
+message TimeBar {
+  google.protobuf.Timestamp time = 1;
+  double open = 2;
+  double high = 3;
+  double low = 4;
+  double close = 5;
+  double base_volume = 6;
+  double notional_volume = 7;
+  int64 trade_count = 8;
+  double buy_volume = 9;
+  double sell_volume = 10;
+}
+
+message GetTimeBarsResponse {
+  TimeBar bar = 1;
+}
+
+message GetWalletSummaryRequest {
+  string wallet = 1;
+  google.protobuf.Timestamp start_time = 2;
+  google.protobuf.Timestamp end_time = 3;
+}
+
+message CoinSummary {
+  string coin = 1;
+  double volume = 2;
+  double notional_volume = 3;
+  int64 fill_count = 4;
+  int64 maker_count = 5;
+  int64 taker_count = 6;
+  double maker_taker_ratio = 7;
+}
+
+message GetWalletSummaryResponse {
+  int64 fill_count = 1;
+  int64 unique_coins = 2;
+  double total_volume = 3;
+  double total_notional = 4;
+  int64 maker_count = 5;
+  int64 taker_count = 6;
+  double maker_taker_ratio = 7;
+  google.protobuf.Timestamp first_fill_time = 8;
+  google.protobuf.Timestamp last_fill_time = 9;
+  repeated CoinSummary per_coin = 10;
+}
+
+message ListCoinsRequest {}
+
+message CoinInfo {
+  string coin = 1;
+  int64 fill_count = 2;
+}
+
+message ListCoinsResponse {
+  repeated CoinInfo coins = 1;
+}
+
+// ─── Admin RPCs ─────────────────────────────────────────────────────
+
+message GetIngestionStatusRequest {}
+
+message GetIngestionStatusResponse {
+  string state = 1; // idle, running, failed, succeeded
+  google.protobuf.Timestamp started_at = 2;
+  google.protobuf.Timestamp last_updated_at = 3;
+  google.protobuf.Timestamp finished_at = 4;
+  string current_hour = 5;
+  int64 hours_done = 6;
+  int64 hours_total = 7;
+  int64 rows_inserted = 8;
+  int64 rows_quarantined = 9;
+  int64 files_missing = 10;
+  int64 files_failed = 11;
+}
+
+message TriggerBackfillRequest {
+  string from_date = 1; // YYYYMMDD
+  string to_date = 2;   // YYYYMMDD
+}
+
+message TriggerBackfillResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message SyncToPresentRequest {}
+
+message SyncToPresentResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message GetDbStatsRequest {}
+
+message PartitionInfo {
+  string date = 1;
+  int64 row_count = 2;
+}
+
+message GetDbStatsResponse {
+  int64 fills_count = 1;
+  int64 quarantine_count = 2;
+  google.protobuf.Timestamp min_time = 3;
+  google.protobuf.Timestamp max_time = 4;
+  repeated PartitionInfo partitions = 5;
+}
+
+message PurgeDataRequest {
+  string before_date = 1; // YYYYMMDD
+}
+
+message PurgeDataResponse {
+  int64 partitions_dropped = 1;
+  string message = 2;
+}
+
+message ReIndexRequest {}
+
+message ReIndexResponse {
+  string message = 1;
+}
+
+// ─── Services ───────────────────────────────────────────────────────
+
+service HistoricalDataService {
+  rpc GetFills(GetFillsRequest) returns (stream GetFillsResponse);
+  rpc GetFillByHash(GetFillByHashRequest) returns (GetFillByHashResponse);
+  rpc GetFillsByOid(GetFillsByOidRequest) returns (stream GetFillsByOidResponse);
+  rpc GetVWAP(GetVWAPRequest) returns (stream GetVWAPResponse);
+  rpc GetTimeBars(GetTimeBarsRequest) returns (stream GetTimeBarsResponse);
+  rpc GetWalletSummary(GetWalletSummaryRequest) returns (GetWalletSummaryResponse);
+  rpc ListCoins(ListCoinsRequest) returns (ListCoinsResponse);
+}
+
+service HistoricalDataAdminService {
+  rpc GetIngestionStatus(GetIngestionStatusRequest) returns (GetIngestionStatusResponse);
+  rpc TriggerBackfill(TriggerBackfillRequest) returns (TriggerBackfillResponse);
+  rpc SyncToPresent(SyncToPresentRequest) returns (SyncToPresentResponse);
+  rpc GetDbStats(GetDbStatsRequest) returns (GetDbStatsResponse);
+  rpc PurgeData(PurgeDataRequest) returns (PurgeDataResponse);
+  rpc ReIndex(ReIndexRequest) returns (ReIndexResponse);
+}

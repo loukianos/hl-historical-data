@@ -1,5 +1,10 @@
 [build-system]
-requires = ["setuptools>=68.0", "setuptools-scm"]
+requires = [
+    "setuptools>=68.0",
+    "wheel",
+    "grpcio-tools>=1.60.0",
+    "protobuf>=4.25.0",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -22,3 +27,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+hl_historical_client = ["py.typed"]
+"hl_historical_client.proto" = ["*.pyi"]
