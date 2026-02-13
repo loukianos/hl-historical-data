@@ -1,22 +1,69 @@
-use crate::backfill::status::SharedBackfillStatus;
+use crate::backfill::status::{BackfillState, SharedBackfillStatus};
 use crate::config::Config;
 use crate::grpc::proto;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use prost_types::Timestamp;
+use std::sync::Arc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response, Status};
 
+const DATE_FORMAT: &str = "%Y%m%d";
+
 pub struct AdminService {
-    _config: Config,
+    config: Config,
     backfill_status: SharedBackfillStatus,
+    ingestion_gate: Arc<Semaphore>,
 }
 
 impl AdminService {
     pub fn new(config: Config, backfill_status: SharedBackfillStatus) -> Self {
         Self {
-            _config: config,
+            config,
             backfill_status,
+            ingestion_gate: Arc::new(Semaphore::new(1)),
         }
     }
+
+    async fn try_start_ingestion(&self) -> Result<OwnedSemaphorePermit, Status> {
+        match self.ingestion_gate.clone().try_acquire_owned() {
+            Ok(permit) => Ok(permit),
+            Err(_) => Err(Status::failed_precondition(
+                self.already_running_message().await,
+            )),
+        }
+    }
+
+    async fn already_running_message(&self) -> String {
+        let status = self.backfill_status.read().await;
+
+        if status.state == BackfillState::Running {
+            let current_hour = status.current_hour.as_deref().unwrap_or("unknown");
+            format!(
+                "backfill already running (current_hour={}, progress={}/{})",
+                current_hour, status.hours_done, status.hours_total
+            )
+        } else {
+            "backfill already running".to_string()
+        }
+    }
+}
+
+fn parse_yyyymmdd(value: &str, field_name: &str) -> Result<NaiveDate, Status> {
+    NaiveDate::parse_from_str(value, DATE_FORMAT)
+        .map_err(|_| Status::invalid_argument(format!("{} must be in YYYYMMDD format", field_name)))
+}
+
+fn validate_backfill_dates(from: &str, to: &str) -> Result<(), Status> {
+    let from_date = parse_yyyymmdd(from, "from_date")?;
+    let to_date = parse_yyyymmdd(to, "to_date")?;
+
+    if to_date < from_date {
+        return Err(Status::invalid_argument(
+            "to_date must be greater than or equal to from_date",
+        ));
+    }
+
+    Ok(())
 }
 
 fn datetime_to_timestamp(datetime: DateTime<Utc>) -> Timestamp {
@@ -52,18 +99,64 @@ impl proto::historical_data_admin_service_server::HistoricalDataAdminService for
 
     async fn trigger_backfill(
         &self,
-        _request: Request<proto::TriggerBackfillRequest>,
+        request: Request<proto::TriggerBackfillRequest>,
     ) -> Result<Response<proto::TriggerBackfillResponse>, Status> {
-        // TODO: implement
-        Err(Status::unimplemented("TriggerBackfill not yet implemented"))
+        let request = request.into_inner();
+        let from = request.from_date.trim().to_string();
+        let to = request.to_date.trim().to_string();
+
+        validate_backfill_dates(&from, &to)?;
+
+        let permit = self.try_start_ingestion().await?;
+
+        let config = self.config.clone();
+        let backfill_status = self.backfill_status.clone();
+        let from_task = from.clone();
+        let to_task = to.clone();
+
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(err) =
+                crate::backfill::run_with_status(&config, backfill_status, &from_task, &to_task)
+                    .await
+            {
+                tracing::error!(
+                    error = %err,
+                    from = %from_task,
+                    to = %to_task,
+                    "admin-triggered backfill failed"
+                );
+            }
+        });
+
+        Ok(Response::new(proto::TriggerBackfillResponse {
+            accepted: true,
+            message: format!("Backfill started for {}..={}", from, to),
+        }))
     }
 
     async fn sync_to_present(
         &self,
         _request: Request<proto::SyncToPresentRequest>,
     ) -> Result<Response<proto::SyncToPresentResponse>, Status> {
-        // TODO: implement
-        Err(Status::unimplemented("SyncToPresent not yet implemented"))
+        let permit = self.try_start_ingestion().await?;
+
+        let config = self.config.clone();
+        let backfill_status = self.backfill_status.clone();
+
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(err) =
+                crate::backfill::sync_to_present_with_status(&config, backfill_status).await
+            {
+                tracing::error!(error = %err, "admin-triggered sync-to-present failed");
+            }
+        });
+
+        Ok(Response::new(proto::SyncToPresentResponse {
+            accepted: true,
+            message: "Sync to present started".to_string(),
+        }))
     }
 
     async fn get_db_stats(
@@ -98,7 +191,7 @@ mod tests {
     use crate::config::Config;
     use crate::grpc::proto;
     use chrono::{DateTime, Utc};
-    use tonic::Request;
+    use tonic::{Code, Request};
 
     fn ts(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)
@@ -181,5 +274,84 @@ mod tests {
         assert_eq!(started.seconds, started_at.timestamp());
         assert_eq!(updated.seconds, last_updated_at.timestamp());
         assert_eq!(finished.seconds, finished_at.timestamp());
+    }
+
+    #[tokio::test]
+    async fn trigger_backfill_rejects_invalid_date_format() {
+        let service = AdminService::new(Config::default(), new_shared());
+
+        let err = <AdminService as proto::historical_data_admin_service_server::HistoricalDataAdminService>::trigger_backfill(
+            &service,
+            Request::new(proto::TriggerBackfillRequest {
+                from_date: "2025-07-28".to_string(),
+                to_date: "20250728".to_string(),
+            }),
+        )
+        .await
+        .expect_err("invalid date format should fail");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("from_date"));
+    }
+
+    #[tokio::test]
+    async fn trigger_backfill_rejects_when_to_date_precedes_from_date() {
+        let service = AdminService::new(Config::default(), new_shared());
+
+        let err = <AdminService as proto::historical_data_admin_service_server::HistoricalDataAdminService>::trigger_backfill(
+            &service,
+            Request::new(proto::TriggerBackfillRequest {
+                from_date: "20250728".to_string(),
+                to_date: "20250727".to_string(),
+            }),
+        )
+        .await
+        .expect_err("invalid range should fail");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("to_date"));
+    }
+
+    #[tokio::test]
+    async fn trigger_backfill_rejects_when_already_running() {
+        let service = AdminService::new(Config::default(), new_shared());
+        let _permit = service
+            .ingestion_gate
+            .clone()
+            .try_acquire_owned()
+            .expect("gate should be acquirable in test setup");
+
+        let err = <AdminService as proto::historical_data_admin_service_server::HistoricalDataAdminService>::trigger_backfill(
+            &service,
+            Request::new(proto::TriggerBackfillRequest {
+                from_date: "20250727".to_string(),
+                to_date: "20250728".to_string(),
+            }),
+        )
+        .await
+        .expect_err("concurrent trigger should fail");
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("already running"));
+    }
+
+    #[tokio::test]
+    async fn sync_to_present_rejects_when_already_running() {
+        let service = AdminService::new(Config::default(), new_shared());
+        let _permit = service
+            .ingestion_gate
+            .clone()
+            .try_acquire_owned()
+            .expect("gate should be acquirable in test setup");
+
+        let err = <AdminService as proto::historical_data_admin_service_server::HistoricalDataAdminService>::sync_to_present(
+            &service,
+            Request::new(proto::SyncToPresentRequest {}),
+        )
+        .await
+        .expect_err("concurrent sync should fail");
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("already running"));
     }
 }
