@@ -2,11 +2,11 @@ use crate::backfill::status::{BackfillState, SharedBackfillStatus};
 use crate::config::Config;
 use crate::db::QuestDbReader;
 use crate::grpc::proto;
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Utc};
 use prost_types::Timestamp;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio_postgres::{Error as PgError, Row};
+use tokio_postgres::{Client, Error as PgError, Row};
 use tonic::{Request, Response, Status};
 
 const DATE_FORMAT: &str = "%Y%m%d";
@@ -103,7 +103,7 @@ fn classify_db_error(operation: &'static str, err: &anyhow::Error) -> Status {
 }
 
 fn map_db_error(operation: &'static str, err: anyhow::Error) -> Status {
-    tracing::error!(operation, error = %err, "admin db stats query failed");
+    tracing::error!(operation, error = %err, "admin db operation failed");
     classify_db_error(operation, &err)
 }
 
@@ -263,7 +263,77 @@ fn normalize_partition_date(raw: &str) -> String {
         return date.format(DATE_FORMAT).to_string();
     }
 
+    if let Ok(datetime) = DateTime::parse_from_rfc3339(trimmed) {
+        return datetime.naive_utc().date().format(DATE_FORMAT).to_string();
+    }
+
+    if let Ok(datetime) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S%.f") {
+        return datetime.date().format(DATE_FORMAT).to_string();
+    }
+
+    if let Ok(datetime) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S") {
+        return datetime.date().format(DATE_FORMAT).to_string();
+    }
+
+    if let Ok(datetime) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%.f") {
+        return datetime.date().format(DATE_FORMAT).to_string();
+    }
+
+    if let Ok(datetime) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S") {
+        return datetime.date().format(DATE_FORMAT).to_string();
+    }
+
     trimmed.to_string()
+}
+
+fn parse_partition_dates(rows: &[Row]) -> Result<Vec<String>, Status> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let preferred_name_col = find_col_index(
+        &rows[0],
+        &["name", "partition", "partition_name", "partitionName"],
+    );
+    let fallback_timestamp_col = find_col_index(
+        &rows[0],
+        &[
+            "minTimestamp",
+            "min_timestamp",
+            "minTime",
+            "min_time",
+            "timestamp",
+            "ts",
+        ],
+    );
+
+    let (date_col, prefer_raw_partition_name) = preferred_name_col
+        .map(|idx| (idx, true))
+        .or_else(|| fallback_timestamp_col.map(|idx| (idx, false)))
+        .ok_or_else(|| {
+            Status::internal("Partition metadata result missing a partition date/name column")
+        })?;
+
+    let mut partitions = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let raw = decode_partition_date(row, date_col)?;
+        let partition = if prefer_raw_partition_name {
+            raw.trim().to_string()
+        } else {
+            let normalized = normalize_partition_date(&raw);
+            match NaiveDate::parse_from_str(&normalized, DATE_FORMAT) {
+                Ok(date) => date.format("%Y-%m-%d").to_string(),
+                Err(_) => raw.trim().to_string(),
+            }
+        };
+        partitions.push(partition);
+    }
+
+    partitions.sort();
+    partitions.dedup();
+
+    Ok(partitions)
 }
 
 fn parse_partition_rows(rows: &[Row]) -> Result<(i64, Vec<proto::PartitionInfo>), Status> {
@@ -352,6 +422,196 @@ async fn try_fetch_fills_partitions(
     }
 
     Err(last_error)
+}
+
+async fn try_fetch_table_partition_dates(
+    client: &Client,
+    table: &'static str,
+) -> Result<Vec<String>, Status> {
+    let show_sql = format!("SHOW PARTITIONS FROM {table}");
+    let table_partitions_sql = format!("SELECT * FROM table_partitions('{table}')");
+    let strategies = [
+        ("SHOW PARTITIONS", show_sql),
+        ("table_partitions", table_partitions_sql),
+    ];
+
+    let mut last_error = Status::internal("partition metadata unavailable");
+
+    for (strategy, sql) in strategies {
+        match client.query(&sql, &[]).await {
+            Ok(rows) => match parse_partition_dates(&rows) {
+                Ok(parsed) => return Ok(parsed),
+                Err(err) => {
+                    tracing::warn!(
+                        strategy,
+                        table,
+                        error = %err,
+                        "failed to parse partition metadata query result"
+                    );
+                    last_error = Status::internal(format!(
+                        "{strategy} returned an unsupported partition metadata schema"
+                    ));
+                }
+            },
+            Err(err) => {
+                let err: anyhow::Error = err.into();
+                tracing::warn!(strategy, table, error = %err, "partition metadata query failed");
+                last_error = classify_db_error("PurgeData(partitions)", &err);
+            }
+        }
+    }
+
+    Err(last_error)
+}
+
+fn partition_dates_strictly_before(partitions: Vec<String>, before: NaiveDate) -> Vec<String> {
+    let mut selected = Vec::new();
+
+    for partition in partitions {
+        let normalized = normalize_partition_date(&partition);
+        match NaiveDate::parse_from_str(&normalized, DATE_FORMAT) {
+            Ok(date) if date < before => selected.push(date.format("%Y-%m-%d").to_string()),
+            Ok(_) => {}
+            Err(_) => {
+                tracing::warn!(partition = %partition, "skipping unparseable partition date");
+            }
+        }
+    }
+
+    selected.sort();
+    selected.dedup();
+
+    selected
+}
+
+async fn enumerate_partitions_before_by_min_time(
+    client: &Client,
+    table: &'static str,
+    before: NaiveDate,
+) -> Result<Vec<NaiveDate>, Status> {
+    let sql = format!("SELECT min(time) AS min_time FROM {table}");
+    let row = client
+        .query_one(&sql, &[])
+        .await
+        .map_err(|err| map_db_error("PurgeData(min_time)", err.into()))?;
+
+    let min_time = decode_optional_naive_datetime(&row, "min_time")?;
+    let Some(min_time) = min_time else {
+        return Ok(Vec::new());
+    };
+
+    let mut current = min_time.date();
+    let mut partitions = Vec::new();
+
+    while current < before {
+        partitions.push(current);
+        current = current
+            .checked_add_signed(Duration::days(1))
+            .ok_or_else(|| {
+                Status::internal("date overflow while enumerating partitions for purge")
+            })?;
+
+        if partitions.len() > 20_000 {
+            return Err(Status::internal(
+                "too many partitions to enumerate while purging",
+            ));
+        }
+    }
+
+    Ok(partitions)
+}
+
+async fn partitions_to_drop_for_table(
+    client: &Client,
+    table: &'static str,
+    before: NaiveDate,
+) -> Result<Vec<String>, Status> {
+    match try_fetch_table_partition_dates(client, table).await {
+        Ok(partitions) => Ok(partition_dates_strictly_before(partitions, before)),
+        Err(err) if err.code() == tonic::Code::Unavailable => Err(err),
+        Err(err) => {
+            tracing::warn!(
+                table,
+                error = %err,
+                "partition metadata unavailable; falling back to min(time) enumeration"
+            );
+            let partitions = enumerate_partitions_before_by_min_time(client, table, before).await?;
+            Ok(partitions
+                .into_iter()
+                .map(|date| date.format("%Y-%m-%d").to_string())
+                .collect())
+        }
+    }
+}
+
+fn build_drop_partition_sql(table: &str, partition_literal: &str) -> String {
+    let escaped_partition_literal = partition_literal.replace('\'', "''");
+    format!("ALTER TABLE {table} DROP PARTITION LIST '{escaped_partition_literal}'")
+}
+
+fn is_missing_partition_error(err: &anyhow::Error) -> bool {
+    let mut message = err.to_string().to_ascii_lowercase();
+
+    if let Some(pg_err) = err.downcast_ref::<PgError>() {
+        if let Some(db_err) = pg_err.as_db_error() {
+            message.push(' ');
+            message.push_str(&db_err.message().to_ascii_lowercase());
+            if let Some(detail) = db_err.detail() {
+                message.push(' ');
+                message.push_str(&detail.to_ascii_lowercase());
+            }
+        }
+    }
+
+    message.contains("partition")
+        && (message.contains("does not exist")
+            || message.contains("doesn't exist")
+            || message.contains("no such partition")
+            || message.contains("not found")
+            || message.contains("unknown partition")
+            || message.contains("missing")
+            || message.contains("cannot find"))
+}
+
+async fn drop_partitions(
+    client: &Client,
+    table: &'static str,
+    partitions: &[String],
+) -> Result<i64, Status> {
+    let mut dropped = 0_i64;
+
+    for partition in partitions {
+        let sql = build_drop_partition_sql(table, partition);
+        match client.execute(&sql, &[]).await {
+            Ok(_) => {
+                dropped = dropped
+                    .checked_add(1)
+                    .ok_or_else(|| Status::internal("partitions_dropped overflow"))?;
+            }
+            Err(err) => {
+                let err: anyhow::Error = err.into();
+
+                if is_missing_partition_error(&err) {
+                    tracing::debug!(
+                        table,
+                        partition = %partition,
+                        "partition already missing; skipping"
+                    );
+                    continue;
+                }
+
+                tracing::error!(
+                    table,
+                    partition = %partition,
+                    error = %err,
+                    "failed to drop partition"
+                );
+                return Err(classify_db_error("PurgeData(drop_partition)", &err));
+            }
+        }
+    }
+
+    Ok(dropped)
 }
 
 #[tonic::async_trait]
@@ -497,10 +757,55 @@ impl proto::historical_data_admin_service_server::HistoricalDataAdminService for
 
     async fn purge_data(
         &self,
-        _request: Request<proto::PurgeDataRequest>,
+        request: Request<proto::PurgeDataRequest>,
     ) -> Result<Response<proto::PurgeDataResponse>, Status> {
-        // TODO: implement
-        Err(Status::unimplemented("PurgeData not yet implemented"))
+        let request = request.into_inner();
+        let before_raw = request.before_date.trim().to_string();
+        let before_date = parse_yyyymmdd(&before_raw, "before_date")?;
+
+        let _permit = self.try_start_ingestion().await?;
+
+        let reader = QuestDbReader::new(&self.config.questdb);
+        let client = reader
+            .connect()
+            .await
+            .map_err(|err| map_db_error("PurgeData(connect)", err))?;
+
+        let fills_partitions = partitions_to_drop_for_table(&client, "fills", before_date).await?;
+        let quarantine_partitions =
+            partitions_to_drop_for_table(&client, "fills_quarantine", before_date).await?;
+
+        tracing::info!(
+            before_date = %before_raw,
+            fills_candidates = fills_partitions.len(),
+            quarantine_candidates = quarantine_partitions.len(),
+            "purging QuestDB partitions"
+        );
+
+        let fills_dropped = drop_partitions(&client, "fills", &fills_partitions).await?;
+        let quarantine_dropped =
+            drop_partitions(&client, "fills_quarantine", &quarantine_partitions).await?;
+
+        let partitions_dropped = fills_dropped
+            .checked_add(quarantine_dropped)
+            .ok_or_else(|| Status::internal("partitions_dropped overflow"))?;
+
+        let message = if partitions_dropped == 0 {
+            format!("No partitions to drop before {}", before_raw)
+        } else {
+            format!(
+                "Dropped {} partitions before {} (fills: {}, fills_quarantine: {}). Disk space may only shrink after QuestDB compaction/cleanup.",
+                partitions_dropped,
+                before_raw,
+                fills_dropped,
+                quarantine_dropped
+            )
+        };
+
+        Ok(Response::new(proto::PurgeDataResponse {
+            partitions_dropped,
+            message,
+        }))
     }
 
     async fn re_index(
@@ -519,7 +824,7 @@ mod tests {
     use crate::backfill::status::{new_shared, BackfillState};
     use crate::config::Config;
     use crate::grpc::proto;
-    use chrono::{DateTime, Utc};
+    use chrono::{DateTime, NaiveDate, Utc};
     use tonic::{Code, Request};
 
     fn ts(value: &str) -> DateTime<Utc> {
@@ -697,5 +1002,57 @@ mod tests {
     #[test]
     fn normalize_partition_date_passthrough_for_unknown_formats() {
         assert_eq!(normalize_partition_date("partition-xyz"), "partition-xyz");
+    }
+
+    #[test]
+    fn normalize_partition_date_compacts_rfc3339_timestamp() {
+        assert_eq!(normalize_partition_date("2025-07-27T00:00:00Z"), "20250727");
+    }
+
+    #[tokio::test]
+    async fn purge_data_rejects_invalid_date_format() {
+        let service = AdminService::new(Config::default(), new_shared());
+
+        let err = <AdminService as proto::historical_data_admin_service_server::HistoricalDataAdminService>::purge_data(
+            &service,
+            Request::new(proto::PurgeDataRequest {
+                before_date: "2025-07-28".to_string(),
+            }),
+        )
+        .await
+        .expect_err("invalid date format should fail");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("before_date"));
+    }
+
+    #[test]
+    fn partition_dates_strictly_before_enforces_strict_before_and_dedups() {
+        let before = NaiveDate::parse_from_str("20250729", super::DATE_FORMAT).expect("valid date");
+        let partitions = vec![
+            "20250727".to_string(),
+            "20250728".to_string(),
+            "20250728".to_string(),
+            "20250729".to_string(),
+            "not-a-date".to_string(),
+        ];
+
+        let selected = super::partition_dates_strictly_before(partitions, before);
+        assert_eq!(
+            selected,
+            vec!["2025-07-27".to_string(), "2025-07-28".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_drop_partition_sql_formats_expected_ddl() {
+        let sql = super::build_drop_partition_sql("fills", "2025-07-27");
+        assert_eq!(sql, "ALTER TABLE fills DROP PARTITION LIST '2025-07-27'");
+    }
+
+    #[test]
+    fn is_missing_partition_error_detects_common_messages() {
+        let err = anyhow::anyhow!("partition does not exist");
+        assert!(super::is_missing_partition_error(&err));
     }
 }
