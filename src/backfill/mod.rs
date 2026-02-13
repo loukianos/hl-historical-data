@@ -11,6 +11,7 @@ use crate::db::questdb::{QuestDbReader, QuestDbWriter};
 use anyhow::{Context, Result};
 use chrono::{Duration, NaiveDate, NaiveDateTime, Timelike, Utc};
 use report::BackfillRunReport;
+use status::{BackfillState, SharedBackfillStatus};
 use std::io::ErrorKind;
 use std::path::Path;
 
@@ -22,25 +23,68 @@ pub async fn run(config: &Config, from: &str, to: &str) -> Result<BackfillRunRep
 
     let keys = s3::generate_hourly_keys(&config.backfill.s3_prefix, from, to)?;
     let report = BackfillRunReport::new(from, to, keys.len());
-    run_with_keys(config, keys, report).await
+    run_with_keys(config, keys, report, None).await
+}
+
+/// Run backfill for a specific date range while updating a shared status object.
+pub async fn run_with_status(
+    config: &Config,
+    backfill_status: SharedBackfillStatus,
+    from: &str,
+    to: &str,
+) -> Result<BackfillRunReport> {
+    tracing::info!("Backfill from={} to={}", from, to);
+
+    let keys = s3::generate_hourly_keys(&config.backfill.s3_prefix, from, to)?;
+    let report = BackfillRunReport::new(from, to, keys.len());
+    run_with_keys(config, keys, report, Some(backfill_status)).await
 }
 
 async fn run_with_keys(
     config: &Config,
     keys: Vec<String>,
     mut report: BackfillRunReport,
+    status: Option<SharedBackfillStatus>,
 ) -> Result<BackfillRunReport> {
+    mark_run_started(status.as_ref(), report.hours_total as i64).await;
+
     // Ensure target tables exist before we start streaming hourly ingestion.
     let reader = QuestDbReader::new(&config.questdb);
-    reader
+    if let Err(err) = reader
         .ensure_tables()
         .await
-        .context("failed to ensure QuestDB tables before backfill")?;
+        .context("failed to ensure QuestDB tables before backfill")
+    {
+        mark_run_failed(status.as_ref()).await;
+        return Err(err);
+    }
     let writer = QuestDbWriter::new(&config.questdb);
 
-    for key in keys {
-        process_hour_key(config, &reader, &writer, &key, &mut report).await?;
+    for (index, key) in keys.iter().enumerate() {
+        let current_hour = current_hour_label(key);
+        update_running_status(
+            status.as_ref(),
+            Some(current_hour.clone()),
+            index as i64,
+            &report,
+        )
+        .await;
+
+        if let Err(err) = process_hour_key(config, &reader, &writer, key, &mut report).await {
+            mark_run_failed(status.as_ref()).await;
+            return Err(err);
+        }
+
+        update_running_status(
+            status.as_ref(),
+            Some(current_hour),
+            (index + 1) as i64,
+            &report,
+        )
+        .await;
     }
+
+    mark_run_succeeded(status.as_ref()).await;
 
     tracing::info!(
         hours_total = report.hours_total,
@@ -281,18 +325,46 @@ async fn delete_hour_rows_before_ingest(reader: &QuestDbReader, key: &str) -> Re
 
 /// Sync from last ingested hour to present.
 pub async fn sync_to_present(config: &Config) -> Result<BackfillRunReport> {
+    sync_to_present_internal(config, None).await
+}
+
+/// Sync from last ingested hour to present while updating shared status.
+pub async fn sync_to_present_with_status(
+    config: &Config,
+    backfill_status: SharedBackfillStatus,
+) -> Result<BackfillRunReport> {
+    sync_to_present_internal(config, Some(backfill_status)).await
+}
+
+async fn sync_to_present_internal(
+    config: &Config,
+    status: Option<SharedBackfillStatus>,
+) -> Result<BackfillRunReport> {
     tracing::info!("Sync to present");
 
     let reader = QuestDbReader::new(&config.questdb);
-    reader
+    if let Err(err) = reader
         .ensure_tables()
         .await
-        .context("failed to ensure QuestDB tables before sync")?;
+        .context("failed to ensure QuestDB tables before sync")
+    {
+        mark_run_started(status.as_ref(), 0).await;
+        mark_run_failed(status.as_ref()).await;
+        return Err(err);
+    }
 
-    let max_fills_time = reader
+    let max_fills_time = match reader
         .max_fills_time()
         .await
-        .context("failed to fetch max(time) from fills")?;
+        .context("failed to fetch max(time) from fills")
+    {
+        Ok(max_fills_time) => max_fills_time,
+        Err(err) => {
+            mark_run_started(status.as_ref(), 0).await;
+            mark_run_failed(status.as_ref()).await;
+            return Err(err);
+        }
+    };
 
     let now_utc = Utc::now().naive_utc();
     let Some((start_inclusive, end_exclusive)) = compute_sync_window(now_utc, max_fills_time)
@@ -303,10 +375,14 @@ pub async fn sync_to_present(config: &Config) -> Result<BackfillRunReport> {
             max_fills_time = ?max_fills_time,
             "No sync work needed: already up to date"
         );
+
+        mark_run_started(status.as_ref(), 0).await;
+        mark_run_succeeded(status.as_ref()).await;
+
         return Ok(BackfillRunReport::new(&today, &today, 0));
     };
 
-    let keys = s3::generate_hourly_keys_between(
+    let keys = match s3::generate_hourly_keys_between(
         &config.backfill.s3_prefix,
         start_inclusive,
         end_exclusive,
@@ -316,7 +392,14 @@ pub async fn sync_to_present(config: &Config) -> Result<BackfillRunReport> {
             "failed to generate hourly keys for sync window [{}, {})",
             start_inclusive, end_exclusive
         )
-    })?;
+    }) {
+        Ok(keys) => keys,
+        Err(err) => {
+            mark_run_started(status.as_ref(), 0).await;
+            mark_run_failed(status.as_ref()).await;
+            return Err(err);
+        }
+    };
 
     let from = start_inclusive.format(SYNC_DATE_FORMAT).to_string();
     let to = (end_exclusive - Duration::hours(1))
@@ -332,7 +415,54 @@ pub async fn sync_to_present(config: &Config) -> Result<BackfillRunReport> {
     );
 
     let report = BackfillRunReport::new(&from, &to, keys.len());
-    run_with_keys(config, keys, report).await
+    run_with_keys(config, keys, report, status).await
+}
+
+fn current_hour_label(key: &str) -> String {
+    hour_window::hour_window_from_key(key)
+        .map(|window| window.start.format("%Y%m%d/%H").to_string())
+        .unwrap_or_else(|_| key.to_string())
+}
+
+async fn mark_run_started(status: Option<&SharedBackfillStatus>, hours_total: i64) {
+    if let Some(status) = status {
+        let mut guard = status.write().await;
+        guard.begin_run(Utc::now(), hours_total);
+    }
+}
+
+async fn update_running_status(
+    status: Option<&SharedBackfillStatus>,
+    current_hour: Option<String>,
+    hours_done: i64,
+    report: &BackfillRunReport,
+) {
+    if let Some(status) = status {
+        let mut guard = status.write().await;
+        guard.update_running(
+            Utc::now(),
+            current_hour,
+            hours_done,
+            report.rows_inserted,
+            report.rows_quarantined,
+            report.hours_missing as i64,
+            report.failed_hours() as i64,
+        );
+    }
+}
+
+async fn mark_run_failed(status: Option<&SharedBackfillStatus>) {
+    if let Some(status) = status {
+        let mut guard = status.write().await;
+        guard.finish(Utc::now(), BackfillState::Failed);
+    }
+}
+
+async fn mark_run_succeeded(status: Option<&SharedBackfillStatus>) {
+    if let Some(status) = status {
+        let mut guard = status.write().await;
+        guard.finish(Utc::now(), BackfillState::Succeeded);
+    }
 }
 
 fn first_available_hour_start() -> NaiveDateTime {
@@ -377,7 +507,7 @@ async fn cleanup_temp_file(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_sync_window, first_available_hour_start};
+    use super::{compute_sync_window, current_hour_label, first_available_hour_start};
     use chrono::{Duration, NaiveDate, NaiveDateTime};
 
     fn dt(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> NaiveDateTime {
@@ -425,5 +555,19 @@ mod tests {
         let window = compute_sync_window(now, None);
 
         assert!(window.is_none());
+    }
+
+    #[test]
+    fn current_hour_label_formats_valid_hour_keys() {
+        assert_eq!(
+            current_hour_label("node_fills_by_block/hourly/20250727/08.lz4"),
+            "20250727/08"
+        );
+    }
+
+    #[test]
+    fn current_hour_label_falls_back_to_raw_key_for_unexpected_format() {
+        let key = "unexpected-key-format";
+        assert_eq!(current_hour_label(key), key);
     }
 }
