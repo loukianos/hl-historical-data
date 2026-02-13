@@ -49,6 +49,14 @@ const GET_VWAP_BASE_SQL: &str = concat!(
     "SELECT time, sum(px * sz) AS notional, sum(sz) AS volume, count() AS fill_count ",
     "FROM fills WHERE time >= $1 AND time < $2 AND coin = $3"
 );
+const GET_TIME_BARS_BASE_SQL: &str = concat!(
+    "SELECT time, ",
+    "first(px) AS open, max(px) AS high, min(px) AS low, last(px) AS close, ",
+    "sum(sz) AS base_volume, sum(px * sz) AS notional_volume, count() AS trade_count, ",
+    "sum(CASE WHEN is_buy = true THEN sz ELSE 0.0 END) AS buy_volume, ",
+    "sum(CASE WHEN is_buy = false THEN sz ELSE 0.0 END) AS sell_volume ",
+    "FROM fills WHERE time >= $1 AND time < $2 AND coin = $3 AND crossed = true"
+);
 const LIST_COINS_SQL: &str =
     "SELECT coin, count() AS fill_count FROM fills GROUP BY coin ORDER BY fill_count DESC";
 
@@ -64,6 +72,14 @@ struct ParsedGetFillsRequest {
 
 #[derive(Debug)]
 struct ParsedGetVwapRequest {
+    coin: String,
+    interval: SampleByInterval,
+    start_time: NaiveDateTime,
+    end_time: NaiveDateTime,
+}
+
+#[derive(Debug)]
+struct ParsedGetTimeBarsRequest {
     coin: String,
     interval: SampleByInterval,
     start_time: NaiveDateTime,
@@ -325,10 +341,58 @@ impl proto::historical_data_service_server::HistoricalDataService for QueryServi
 
     async fn get_time_bars(
         &self,
-        _request: Request<proto::GetTimeBarsRequest>,
+        request: Request<proto::GetTimeBarsRequest>,
     ) -> Result<Response<Self::GetTimeBarsStream>, Status> {
-        // TODO: implement query
-        Err(Status::unimplemented("GetTimeBars not yet implemented"))
+        let parsed = parse_get_time_bars_request(request.into_inner())?;
+        let sql = build_get_time_bars_sql(parsed.interval);
+        let params: Vec<&(dyn ToSql + Sync)> =
+            vec![&parsed.start_time, &parsed.end_time, &parsed.coin];
+
+        let reader = QuestDbReader::new(&self.config.questdb);
+        let mut row_stream = reader
+            .query_stream(&sql, &params)
+            .await
+            .map_err(|err| map_query_start_error("GetTimeBars", err))?;
+
+        let (tx, rx) = mpsc::channel(GET_FILLS_STREAM_BUFFER);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tx.closed() => return,
+                    next_row = row_stream.next() => {
+                        match next_row {
+                            Some(Ok(row)) => match row_to_time_bar(&row) {
+                                Ok(bar) => {
+                                    if tx
+                                        .send(Ok(proto::GetTimeBarsResponse { bar: Some(bar) }))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                Err(status) => {
+                                    let _ = tx.send(Err(status)).await;
+                                    return;
+                                }
+                            },
+                            Some(Err(err)) => {
+                                tracing::error!(error = %err, "GetTimeBars row stream failed");
+                                let _ = tx
+                                    .send(Err(Status::unavailable(
+                                        "QuestDB stream error during GetTimeBars query",
+                                    )))
+                                    .await;
+                                return;
+                            }
+                            None => return,
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn get_wallet_summary(
@@ -413,6 +477,28 @@ fn parse_get_vwap_request(request: proto::GetVwapRequest) -> Result<ParsedGetVwa
     }
 
     Ok(ParsedGetVwapRequest {
+        coin: normalize_required_string(request.coin, "coin")?,
+        interval: parse_interval(request.interval)?,
+        start_time,
+        end_time,
+    })
+}
+
+fn parse_get_time_bars_request(
+    request: proto::GetTimeBarsRequest,
+) -> Result<ParsedGetTimeBarsRequest, Status> {
+    let start_ts = require_non_zero_timestamp(request.start_time, "start_time")?;
+    let end_ts = require_non_zero_timestamp(request.end_time, "end_time")?;
+
+    let start_time = timestamp_to_naive(&start_ts, "start_time")?;
+    let end_time = timestamp_to_naive(&end_ts, "end_time")?;
+    if start_time >= end_time {
+        return Err(Status::invalid_argument(
+            "start_time must be strictly earlier than end_time",
+        ));
+    }
+
+    Ok(ParsedGetTimeBarsRequest {
         coin: normalize_required_string(request.coin, "coin")?,
         interval: parse_interval(request.interval)?,
         start_time,
@@ -571,6 +657,13 @@ fn build_get_vwap_sql(interval: SampleByInterval) -> String {
     )
 }
 
+fn build_get_time_bars_sql(interval: SampleByInterval) -> String {
+    format!(
+        "{GET_TIME_BARS_BASE_SQL} SAMPLE BY {} ORDER BY time ASC",
+        interval.as_questdb()
+    )
+}
+
 fn decode_required<T>(row: &Row, column: &'static str) -> Result<T, Status>
 where
     for<'a> T: FromSql<'a>,
@@ -635,6 +728,32 @@ fn row_to_vwap_point(row: &Row) -> Result<proto::VwapPoint, Status> {
         volume,
         notional,
         fill_count,
+    })
+}
+
+fn row_to_time_bar(row: &Row) -> Result<proto::TimeBar, Status> {
+    let time: NaiveDateTime = decode_required(row, "time")?;
+    let open: f64 = decode_required(row, "open")?;
+    let high: f64 = decode_required(row, "high")?;
+    let low: f64 = decode_required(row, "low")?;
+    let close: f64 = decode_required(row, "close")?;
+    let base_volume: f64 = decode_optional(row, "base_volume")?.unwrap_or(0.0);
+    let notional_volume: f64 = decode_optional(row, "notional_volume")?.unwrap_or(0.0);
+    let trade_count: i64 = decode_required_count(row, "trade_count")?;
+    let buy_volume: f64 = decode_optional(row, "buy_volume")?.unwrap_or(0.0);
+    let sell_volume: f64 = decode_optional(row, "sell_volume")?.unwrap_or(0.0);
+
+    Ok(proto::TimeBar {
+        time: Some(naive_to_timestamp(time)),
+        open,
+        high,
+        low,
+        close,
+        base_volume,
+        notional_volume,
+        trade_count,
+        buy_volume,
+        sell_volume,
     })
 }
 
@@ -948,6 +1067,47 @@ mod tests {
     }
 
     #[test]
+    fn parse_get_time_bars_request_rejects_blank_coin() {
+        let request = proto::GetTimeBarsRequest {
+            coin: "   ".to_string(),
+            interval: INTERVAL_1M,
+            start_time: Some(ts(100, 0)),
+            end_time: Some(ts(200, 0)),
+        };
+
+        let err = parse_get_time_bars_request(request).expect_err("blank coin should fail");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn parse_get_time_bars_request_rejects_invalid_time_order() {
+        let request = proto::GetTimeBarsRequest {
+            coin: "BTC".to_string(),
+            interval: INTERVAL_5M,
+            start_time: Some(ts(200, 0)),
+            end_time: Some(ts(200, 0)),
+        };
+
+        let err = parse_get_time_bars_request(request).expect_err("start == end should fail");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn parse_get_time_bars_request_accepts_valid_payload() {
+        let request = proto::GetTimeBarsRequest {
+            coin: " ETH ".to_string(),
+            interval: INTERVAL_5S,
+            start_time: Some(ts(1_737_600_000, 0)),
+            end_time: Some(ts(1_737_600_300, 0)),
+        };
+
+        let parsed = parse_get_time_bars_request(request).expect("request should parse");
+        assert_eq!(parsed.coin, "ETH");
+        assert_eq!(parsed.interval, SampleByInterval::S5);
+        assert!(parsed.start_time < parsed.end_time);
+    }
+
+    #[test]
     fn build_get_vwap_sql_includes_sample_by_and_ordering() {
         let sql = build_get_vwap_sql(SampleByInterval::M15);
         assert!(sql.contains("time >= $1 AND time < $2 AND coin = $3"));
@@ -955,6 +1115,24 @@ mod tests {
         assert!(sql.contains("sum(sz) AS volume"));
         assert!(sql.contains("count() AS fill_count"));
         assert!(sql.contains("SAMPLE BY 15m"));
+        assert!(sql.ends_with("ORDER BY time ASC"));
+    }
+
+    #[test]
+    fn build_get_time_bars_sql_includes_sample_by_and_aggressor_logic() {
+        let sql = build_get_time_bars_sql(SampleByInterval::S30);
+        assert!(sql.contains("time >= $1 AND time < $2 AND coin = $3"));
+        assert!(sql.contains("AND crossed = true"));
+        assert!(sql.contains("first(px) AS open"));
+        assert!(sql.contains("max(px) AS high"));
+        assert!(sql.contains("min(px) AS low"));
+        assert!(sql.contains("last(px) AS close"));
+        assert!(sql.contains("sum(sz) AS base_volume"));
+        assert!(sql.contains("sum(px * sz) AS notional_volume"));
+        assert!(sql.contains("count() AS trade_count"));
+        assert!(sql.contains("CASE WHEN is_buy = true THEN sz ELSE 0.0 END"));
+        assert!(sql.contains("CASE WHEN is_buy = false THEN sz ELSE 0.0 END"));
+        assert!(sql.contains("SAMPLE BY 30s"));
         assert!(sql.ends_with("ORDER BY time ASC"));
     }
 
