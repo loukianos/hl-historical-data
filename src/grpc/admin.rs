@@ -812,8 +812,25 @@ impl proto::historical_data_admin_service_server::HistoricalDataAdminService for
         &self,
         _request: Request<proto::ReIndexRequest>,
     ) -> Result<Response<proto::ReIndexResponse>, Status> {
-        // TODO: implement
-        Err(Status::unimplemented("ReIndex not yet implemented"))
+        let _permit = self.try_start_ingestion().await?;
+
+        let reader = QuestDbReader::new(&self.config.questdb);
+        let summary = reader
+            .ensure_expected_indexes()
+            .await
+            .map_err(|err| map_db_error("ReIndex(ensure_expected_indexes)", err))?;
+
+        let message = if summary.created == 0 {
+            "All expected indexes already exist for fills.coin and fills.address. No indexes were dropped or rebuilt."
+                .to_string()
+        } else {
+            format!(
+                "Created {} missing index(es); {} already existed (fills.coin, fills.address). No indexes were dropped or rebuilt.",
+                summary.created, summary.already_present
+            )
+        };
+
+        Ok(Response::new(proto::ReIndexResponse { message }))
     }
 }
 
@@ -984,6 +1001,26 @@ mod tests {
         )
         .await
         .expect_err("concurrent sync should fail");
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("already running"));
+    }
+
+    #[tokio::test]
+    async fn re_index_rejects_when_already_running() {
+        let service = AdminService::new(Config::default(), new_shared());
+        let _permit = service
+            .ingestion_gate
+            .clone()
+            .try_acquire_owned()
+            .expect("gate should be acquirable in test setup");
+
+        let err = <AdminService as proto::historical_data_admin_service_server::HistoricalDataAdminService>::re_index(
+            &service,
+            Request::new(proto::ReIndexRequest {}),
+        )
+        .await
+        .expect_err("concurrent reindex should fail");
 
         assert_eq!(err.code(), Code::FailedPrecondition);
         assert!(err.message().contains("already running"));

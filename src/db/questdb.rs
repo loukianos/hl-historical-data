@@ -16,6 +16,30 @@ pub const DEFAULT_ILP_BATCH_MAX_LINES: usize = 5_000;
 /// Default maximum ILP payload size per write batch.
 pub const DEFAULT_ILP_BATCH_MAX_BYTES: usize = 1_000_000;
 
+#[derive(Debug, Clone, Copy)]
+struct ExpectedIndex {
+    table: &'static str,
+    column: &'static str,
+}
+
+// Canonical index expectations from docs/adr/0001-questdb-types.md.
+const EXPECTED_INDEXES: &[ExpectedIndex] = &[
+    ExpectedIndex {
+        table: "fills",
+        column: "coin",
+    },
+    ExpectedIndex {
+        table: "fills",
+        column: "address",
+    },
+];
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EnsureIndexesSummary {
+    pub created: usize,
+    pub already_present: usize,
+}
+
 /// Supported ILP field value types for formatting line protocol records.
 #[derive(Debug, Clone, PartialEq)]
 pub enum IlpFieldValue {
@@ -287,11 +311,32 @@ impl QuestDbReader {
             .await?;
 
         // Best effort: if table already existed without indexes, try to add them.
-        ensure_symbol_index(&client, "fills", "coin").await?;
-        ensure_symbol_index(&client, "fills", "address").await?;
+        self.ensure_expected_indexes_with_client(&client).await?;
 
         tracing::info!("QuestDB tables ensured");
         Ok(())
+    }
+
+    /// Ensure all expected indexes exist (idempotent).
+    pub async fn ensure_expected_indexes(&self) -> Result<EnsureIndexesSummary> {
+        let client = self.connect().await?;
+        self.ensure_expected_indexes_with_client(&client).await
+    }
+
+    async fn ensure_expected_indexes_with_client(
+        &self,
+        client: &tokio_postgres::Client,
+    ) -> Result<EnsureIndexesSummary> {
+        let mut summary = EnsureIndexesSummary::default();
+
+        for expected in EXPECTED_INDEXES {
+            match ensure_symbol_index(client, expected.table, expected.column).await? {
+                EnsureIndexOutcome::Created => summary.created += 1,
+                EnsureIndexOutcome::AlreadyPresent => summary.already_present += 1,
+            }
+        }
+
+        Ok(summary)
     }
 }
 
@@ -302,23 +347,71 @@ pub struct QuestDbWriter {
     batch_max_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnsureIndexOutcome {
+    Created,
+    AlreadyPresent,
+}
+
 async fn ensure_symbol_index(
     client: &tokio_postgres::Client,
     table: &str,
     column: &str,
-) -> Result<()> {
+) -> Result<EnsureIndexOutcome> {
     let sql = format!("ALTER TABLE {table} ALTER COLUMN {column} ADD INDEX");
-    if let Err(err) = client.execute(&sql, &[]).await {
-        let msg = err.to_string().to_ascii_lowercase();
-        if msg.contains("already") || msg.contains("exists") {
-            tracing::debug!("Index already exists for {}.{}", table, column);
-            return Ok(());
+    match client.execute(&sql, &[]).await {
+        Ok(_) => {
+            tracing::info!("Ensured index on {}.{}", table, column);
+            Ok(EnsureIndexOutcome::Created)
         }
-        return Err(err.into());
+        Err(err) => {
+            if is_already_indexed_error(&err) {
+                tracing::debug!("Index already exists for {}.{}", table, column);
+                Ok(EnsureIndexOutcome::AlreadyPresent)
+            } else {
+                Err(err.into())
+            }
+        }
+    }
+}
+
+fn is_already_indexed_error(err: &tokio_postgres::Error) -> bool {
+    if let Some(db_error) = err.as_db_error() {
+        if is_already_indexed_message(db_error.message()) {
+            return true;
+        }
+
+        if let Some(detail) = db_error.detail() {
+            if is_already_indexed_message(detail) {
+                return true;
+            }
+        }
     }
 
-    tracing::info!("Ensured index on {}.{}", table, column);
-    Ok(())
+    is_already_indexed_message(&err.to_string())
+}
+
+fn is_already_indexed_message(message: &str) -> bool {
+    let msg = message.to_ascii_lowercase();
+
+    if msg.contains("already indexed") {
+        return true;
+    }
+
+    if msg.contains("does not exist")
+        || msg.contains("unknown column")
+        || msg.contains("unknown table")
+        || msg.contains("column not found")
+        || msg.contains("table not found")
+    {
+        return false;
+    }
+
+    let mentions_index = msg.contains("index") || msg.contains("indexed");
+    let says_exists =
+        msg.contains("already") || msg.contains("exists") || msg.contains("duplicate");
+
+    mentions_index && says_exists
 }
 
 impl QuestDbWriter {
@@ -554,6 +647,30 @@ mod tests {
 
         let nan_float = format_ilp_line("fills", &[], &[("px", IlpFieldValue::Float(f64::NAN))], 1);
         assert!(nan_float.is_err());
+    }
+
+    #[test]
+    fn is_already_indexed_message_accepts_already_indexed_errors() {
+        assert!(is_already_indexed_message("column is already indexed"));
+        assert!(is_already_indexed_message(
+            "Index already exists for column address"
+        ));
+    }
+
+    #[test]
+    fn is_already_indexed_message_rejects_missing_table_or_column_errors() {
+        assert!(!is_already_indexed_message("table 'fills' does not exist"));
+        assert!(!is_already_indexed_message(
+            "column 'address' does not exist"
+        ));
+        assert!(!is_already_indexed_message("unknown column: address"));
+    }
+
+    #[test]
+    fn is_already_indexed_message_prefers_positive_match() {
+        assert!(is_already_indexed_message(
+            "unknown warning: column is already indexed"
+        ));
     }
 
     #[tokio::test]
